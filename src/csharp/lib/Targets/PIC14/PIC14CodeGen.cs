@@ -14,6 +14,7 @@
  * -----------------------------------------------------------------------------
  */
 
+using System.Text.RegularExpressions;
 using PyMCU.Backend.Analysis;
 using PyMCU.Common;
 using PyMCU.Common.Models;
@@ -55,6 +56,100 @@ public class PIC14CodeGen : CodeGen
     }
 
     private string MakeLabel(string prefix) => $"{prefix}_{_labelCounter++}";
+
+    // --- Inline-asm hygiene ------------------------------------------------
+    //
+    // @inline HAL functions (e.g. _delay_ms_pic14) carry raw asm() blocks that
+    //   1. define local labels ("_dly_inner:") — duplicated verbatim on every
+    //      inline expansion, which gpasm rejects, and
+    //   2. reference reserved "__" scratch cells ("__dly_c1") that no IR
+    //      instruction ever declares, so nothing allocates them.
+    // Both are backend responsibilities: labels are made unique per contiguous
+    // InlineAsm run, and "__" data operands get 1-byte allocations after the
+    // compiled stack (same dynamic region GetOrAllocVariable uses).
+
+    private static readonly Regex AsmLabelDef =
+        new(@"^\s*(_[A-Za-z_][A-Za-z0-9_]*):", RegexOptions.Compiled);
+    private static readonly Regex AsmScratchRef =
+        new(@"\b__[A-Za-z_][A-Za-z0-9_]*\b", RegexOptions.Compiled);
+    private static readonly Regex AsmCodeRef =
+        new(@"\b(?:CALL|GOTO)\s+(__[A-Za-z_][A-Za-z0-9_]*)\b",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private int _asmRunCounter;
+
+    /// <summary>
+    /// Rewrites every maximal run of consecutive <see cref="InlineAsm"/>
+    /// instructions so that local labels defined inside the run get a unique
+    /// per-run suffix. References within the same run are renamed accordingly.
+    /// </summary>
+    private List<Instruction> UniquifyInlineAsmLabels(List<Instruction> body)
+    {
+        var result = new List<Instruction>(body.Count);
+        int i = 0;
+        while (i < body.Count)
+        {
+            if (body[i] is not InlineAsm) { result.Add(body[i]); i++; continue; }
+
+            int start = i;
+            while (i < body.Count && body[i] is InlineAsm) i++;
+
+            var renames = new Dictionary<string, string>();
+            for (int j = start; j < i; j++)
+            {
+                var m = AsmLabelDef.Match(((InlineAsm)body[j]).Code);
+                if (m.Success && !renames.ContainsKey(m.Groups[1].Value))
+                    renames[m.Groups[1].Value] = $"{m.Groups[1].Value}_{_asmRunCounter}";
+            }
+            if (renames.Count > 0) _asmRunCounter++;
+
+            for (int j = start; j < i; j++)
+            {
+                var ia = (InlineAsm)body[j];
+                var code = ia.Code;
+                foreach (var (oldName, newName) in renames)
+                    code = Regex.Replace(code, $@"\b{Regex.Escape(oldName)}\b", newName);
+                result.Add(code == ia.Code ? ia : ia with { Code = code });
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Allocates one byte (after the compiled stack) for every reserved
+    /// "__"-prefixed data symbol referenced by inline asm and emits its EQU.
+    /// Code symbols (CALL/GOTO targets), asm-defined labels, stack variables
+    /// and the float workspace are excluded.
+    /// </summary>
+    private void EmitInlineAsmScratchSymbols(ProgramIR program)
+    {
+        var definedLabels = new HashSet<string> { "__interrupt" };
+        var codeRefs = new HashSet<string>();
+        var referenced = new List<string>();
+
+        foreach (var func in program.Functions)
+        foreach (var instr in func.Body)
+        {
+            if (instr is not InlineAsm ia) continue;
+            var def = AsmLabelDef.Match(ia.Code);
+            if (def.Success) { definedLabels.Add(def.Groups[1].Value); continue; }
+            foreach (Match m in AsmCodeRef.Matches(ia.Code))
+                codeRefs.Add(m.Groups[1].Value);
+            foreach (Match m in AsmScratchRef.Matches(ia.Code))
+                referenced.Add(m.Value);
+        }
+
+        bool any = false;
+        foreach (var name in referenced.Distinct())
+        {
+            if (definedLabels.Contains(name) || codeRefs.Contains(name)) continue;
+            if (name.StartsWith("__FP_")) continue; // float workspace lives in the CBLOCK
+            if (_stackLayout.ContainsKey(name) || _symbolTable.ContainsKey(name)) continue;
+            if (!any) { EmitComment("--- Inline-asm scratch symbols ---"); any = true; }
+            _symbolTable[name] = _ramHead++;
+            EmitRaw($"{name} EQU 0x{_symbolTable[name]:X2}");
+        }
+        if (any) EmitRaw("");
+    }
 
     // Parse a hex address string that may or may not have a leading "0x"/"0X" prefix.
     private static int ParseHexAddr(string s)
@@ -202,6 +297,11 @@ public class PIC14CodeGen : CodeGen
     {
         _assembly.Clear();
 
+        // Make labels defined inside @inline asm() blocks unique per expansion
+        // (a HAL delay loop inlined twice would otherwise duplicate its label).
+        foreach (var func in program.Functions)
+            func.Body = UniquifyInlineAsmLabels(func.Body);
+
         var allocator = new StackAllocator();
         var (offsets, totalSize) = allocator.Allocate(program);
 
@@ -268,6 +368,9 @@ public class PIC14CodeGen : CodeGen
                 EmitRaw($"{kv.Key} EQU _stack_base + {kv.Value}");
             EmitRaw("");
         }
+
+        // 3.5 Scratch cells referenced by inline asm ("__dly_c1" etc.)
+        EmitInlineAsmScratchSymbols(program);
 
         // 4. Reset vector
         int resetAddr = Config.ResetVector >= 0 ? Config.ResetVector : 0x0000;
