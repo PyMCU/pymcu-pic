@@ -1483,6 +1483,7 @@ public class PIC14CodeGen : CodeGen
                 {
                     string loopLbl = MakeLabel("augls");
                     string doneLbl = MakeLabel("augls_done");
+                    GetOrAllocVariable("__tmp");
                     Emit("MOVWF", "__tmp");
                     Emit("MOVF", "__tmp", "F");
                     Emit("BTFSC", "STATUS", "2");
@@ -1499,6 +1500,7 @@ public class PIC14CodeGen : CodeGen
                 {
                     string loopLbl = MakeLabel("augrs");
                     string doneLbl = MakeLabel("augrs_done");
+                    GetOrAllocVariable("__tmp");
                     Emit("MOVWF", "__tmp");
                     Emit("MOVF", "__tmp", "F");
                     Emit("BTFSC", "STATUS", "2");
@@ -1659,6 +1661,7 @@ public class PIC14CodeGen : CodeGen
                 string loopLbl = MakeLabel("augls16");
                 string doneLbl = MakeLabel("augls16_done");
                 LoadIntoW(arg.Operand);
+                GetOrAllocVariable("__tmp");
                 Emit("MOVWF", "__tmp");
                 EmitLabel(loopLbl);
                 Emit("MOVF", "__tmp", "F");
