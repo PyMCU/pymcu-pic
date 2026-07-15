@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <IsPackable>false</IsPackable>
+        <RootNamespace>PyMCU.IntegrationTests</RootNamespace>
+        <AssemblyName>PyMCU.PIC.IntegrationTests</AssemblyName>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <!-- PicSharp emulator TestKit — sibling repo checkout (../PicSharp next to ../pymcu-pic). -->
+        <ProjectReference Include="..\..\..\PicSharp\src\PicSharp.TestKit\PicSharp.TestKit.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+        <PackageReference Include="NUnit" Version="3.14.0" />
+        <PackageReference Include="NUnit3TestAdapter" Version="4.6.0" />
+        <PackageReference Include="FluentAssertions" Version="6.12.0" />
+    </ItemGroup>
+
+</Project>

@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>PyMCU.Backend.PIC.Cli</RootNamespace>
+    <AssemblyName>pymcuc-pic</AssemblyName>
+    <!-- MIT: free PIC backend CLI. -->
+    <!-- SPDX-License-Identifier: MIT -->
+    <PublishAot>true</PublishAot>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <StripSymbols>true</StripSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\lib\PyMCU.Backend.PIC.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.CommandLine" Version="2.0.6" />
+  </ItemGroup>
+
+</Project>

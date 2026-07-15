@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>PyMCU</RootNamespace>
+    <AssemblyName>PyMCU.Backend.PIC</AssemblyName>
+    <!-- MIT: PIC backend is free and open source. -->
+    <!-- SPDX-License-Identifier: MIT -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- pymcu-sdk lives in the PyMCU/pymcu monorepo.
+         Expects both repos checked out as siblings: ../PyMCU/ next to ../pymcu-pic/ -->
+    <ProjectReference Include="..\..\..\..\PyMCU\extensions\pymcu-sdk\csharp\PyMCU.Backend.SDK.csproj" />
+  </ItemGroup>
+
+</Project>

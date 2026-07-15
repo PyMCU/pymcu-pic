@@ -1,0 +1,30 @@
+# Build outputs
+bin/
+obj/
+*.user
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+
+# Test results
+test-results/
+TestResults/
+
+# IDE
+.idea/
+.vs/
+*.suo
+*.DS_Store
+
+# dotnet publish output
+build/bin/
+
+# venv symlink (points at the monorepo venv) and the locally deployed backend binary
+.venv
+src/python/pymcu/backend/pic/pymcuc-pic
+*.signlock
