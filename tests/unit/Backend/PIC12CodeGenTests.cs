@@ -54,12 +54,16 @@ public class PIC12CodeGenTests
         Assert.Contains("ADDWF", asm);
     }
 
-    // ─── FactorySupport ──────────────────────────────────────────────────────
+    // ─── ProviderSupport ─────────────────────────────────────────────────────
+    // (was FactorySupport: CodeGenFactory moved to the monorepo's external-backend
+    // guard; chip dispatch now lives in PicBackendProvider.)
 
     [Fact]
-    public void FactorySupport()
+    public void ProviderSupport()
     {
-        var codegen = CodeGenFactory.Create("pic10f200", Pic10f200);
+        var provider = new PyMCU.Backend.Targets.PIC.PicBackendProvider();
+        Assert.True(provider.Supports("pic10f200"));
+        var codegen = provider.Create(Pic10f200);
         Assert.IsType<PIC12CodeGen>(codegen);
     }
 

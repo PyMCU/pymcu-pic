@@ -72,7 +72,10 @@ public class PIC18CodeGenTests
     [Fact]
     public void ArithmeticAndFactory()
     {
-        var codegen = CodeGenFactory.Create("pic18f45k50", Pic18f45k50);
+        // (was CodeGenFactory.Create: chip dispatch now lives in PicBackendProvider.)
+        var provider = new PyMCU.Backend.Targets.PIC.PicBackendProvider();
+        Assert.True(provider.Supports("pic18f45k50"));
+        var codegen = provider.Create(Pic18f45k50);
         Assert.IsType<PIC18CodeGen>(codegen);
 
         // a = 10 + b → MOVLW 0x0A; ADDWF b, W; MOVWF a
