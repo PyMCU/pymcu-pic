@@ -41,6 +41,24 @@ public class PIC14CodeGen : CodeGen
     private bool _currentBlockTerminated;
     private string _currentFunctionName = "";
 
+    // --- Software mul/div/mod + array-index scratch -------------------------
+    //
+    // PIC14 has no hardware multiplier/divider, so Mul/Div/FloorDiv/Mod lower
+    // to CALLs into software routines emitted once per program. Their operand
+    // cells live in COMMON RAM (0x70-0x7F on most midrange parts, mirrored in
+    // every bank) so callers never need a bank select around them. On tiny
+    // parts whose GPRs stop before 0x70 (PIC16F84A: 0x0C-0x4F, mirrored in
+    // bank 1) the scratch block moves to the top of bank 0 instead — those
+    // GPRs are bank-mirrored too, so the "no bank select" property holds.
+    private bool _needsMul8, _needsDiv8, _needsMul16, _needsDiv16, _needsArrIdxScale;
+    private int _scratchBase;
+    private bool NeedsMulDivScratch => _needsMul8 || _needsDiv8 || _needsMul16 || _needsDiv16;
+    private string ScratchA => "__m_a";   // 2 bytes: mul multiplicand / div dividend->quotient
+    private string ScratchB => "__m_b";   // 2 bytes: mul multiplier / div divisor
+    private string ScratchR => "__m_r";   // 2 bytes: mul product / div remainder
+    private string ScratchC => "__m_c";   // 1 byte : div bit counter
+    private string ScratchIdx => "__arr_i"; // 1 byte: scaled array index (16-bit elements)
+
     public PIC14CodeGen(DeviceConfig cfg)
     {
         Config = cfg;
@@ -334,6 +352,11 @@ public class PIC14CodeGen : CodeGen
         _stackLayout = offsets;
         _varSizes = allocator.VariableSizes;
 
+        // Common-RAM scratch window for the software mul/div routines and the
+        // array-index scaler. See the field comments for the placement rules.
+        _scratchBase = Config.RamSize > 0 && Config.RamSize < 96 ? 0x48 : 0x70;
+        ScanForSoftwareRoutines(program);
+
         // Advance ram_head past the stack (and float workspace) to prevent
         // collisions with dynamically-allocated variables (delay counters, etc.)
         _ramHead = 0x20 + totalSize;
@@ -368,6 +391,9 @@ public class PIC14CodeGen : CodeGen
                 EmitRaw($"{kv.Key} EQU _stack_base + {kv.Value}");
             EmitRaw("");
         }
+
+        // 3.4 Common-RAM scratch cells for software mul/div and array indexing
+        EmitScratchSymbols();
 
         // 3.5 Scratch cells referenced by inline asm ("__dly_c1" etc.)
         EmitInlineAsmScratchSymbols(program);
@@ -468,10 +494,34 @@ public class PIC14CodeGen : CodeGen
             }
         }
 
+        // Software arithmetic routines (emitted once, after all functions)
+        EmitSoftwareRoutines();
+
+        if (_needsErrTrap)
+        {
+            EmitComment("--- Uncaught error in main: park here (code in __err) ---");
+            EmitLabel("__err_trap");
+            Emit("GOTO", "__err_trap");
+        }
+
         if (_usesFloat)
             EmitRaw("#include \"float.inc\"");
 
         EmitRaw("\tEND");
+
+        // The bump allocator is bank-0 only: the compiled stack starts at 0x20
+        // and dynamic cells grow upward. Fail loudly if the program outgrew the
+        // window instead of silently aliasing SFRs or the scratch block.
+        int ramLimit = NeedsMulDivScratch || _needsArrIdxScale
+            ? _scratchBase
+            : (Config.RamSize > 0 && Config.RamSize < 96 ? 0x50 : 0x80);
+        if (_ramHead > ramLimit)
+            throw new InvalidOperationException(
+                $"PIC14: RAM allocation overflows the bank-0 window " +
+                $"(head=0x{_ramHead:X2}, limit=0x{ramLimit:X2}). The PIC14 backend " +
+                "allocates all variables in bank 0 starting at 0x20 " +
+                "(plus the common-RAM scratch block when mul/div or arrays are used); " +
+                "reduce locals/array sizes.");
 
         // Peephole optimization pass
         _assembly = PIC14Peephole.Optimize(_assembly);
@@ -485,6 +535,7 @@ public class PIC14CodeGen : CodeGen
     private void CompileFunction(Function func)
     {
         EmitLabel(func.Name);
+        _currentFunctionName = func.Name;
         _currentBank = -1;
         _currentBlockTerminated = false;
 
@@ -535,16 +586,540 @@ public class PIC14CodeGen : CodeGen
             case JumpIfBitSet arg: CompileVariant(arg); break;
             case JumpIfBitClear arg: CompileVariant(arg); break;
             case Call arg: CompileVariant(arg); break;
-            case ArrayLoad:
-                throw new NotSupportedException(
-                    "PIC14CodeGen: ArrayLoad (array indexing) is not implemented yet for the PIC14 backend. " +
-                    "The instruction was previously ignored silently, producing wrong code.");
-            case ArrayStore:
-                throw new NotSupportedException(
-                    "PIC14CodeGen: ArrayStore (array element assignment) is not implemented yet for the PIC14 backend. " +
-                    "The instruction was previously ignored silently, producing wrong code.");
+            case ArrayLoad arg: CompileVariant(arg); break;
+            case ArrayStore arg: CompileVariant(arg); break;
+            case SignalError arg: CompileVariant(arg); break;
+            case SignalSuccess arg: CompileVariant(arg); break;
+            case BranchOnError arg: CompileVariant(arg); break;
             default:
                 throw new NotSupportedException($"PIC14CodeGen: unsupported instruction {instr.GetType().Name}");
+        }
+    }
+
+    // --- Software mul/div/mod ------------------------------------------------
+
+    private static bool IsMulDivOp(IrBinOp op) =>
+        op is IrBinOp.Mul or IrBinOp.Div or IrBinOp.FloorDiv or IrBinOp.Mod;
+
+    // Routine selection runs at the WIDEST of the three operands: a uint16
+    // dividend divided into a uint8 destination still needs the 16-bit routine.
+    private int MulDivOpSize(Val src1, Val src2, Val dst) =>
+        Math.Max(GetValSize(dst), Math.Max(GetValSize(src1), GetValSize(src2)));
+
+    private void RecordMulDiv(IrBinOp op, int size)
+    {
+        if (op == IrBinOp.Mul)
+        {
+            if (size == 1) _needsMul8 = true;
+            else _needsMul16 = true;
+        }
+        else
+        {
+            if (size == 1) _needsDiv8 = true;
+            else _needsDiv16 = true;
+        }
+    }
+
+    // Pre-scan (before the header is emitted) so the scratch EQUs land in the
+    // preamble and the routines are appended after the last function.
+    private void ScanForSoftwareRoutines(ProgramIR program)
+    {
+        foreach (var func in program.Functions)
+        foreach (var instr in func.Body)
+        {
+            switch (instr)
+            {
+                case Binary b when IsMulDivOp(b.Op):
+                {
+                    int size = MulDivOpSize(b.Src1, b.Src2, b.Dst);
+                    if (size <= 2) RecordMulDiv(b.Op, size);
+                    break;
+                }
+                case AugAssign a when IsMulDivOp(a.Op):
+                {
+                    int size = MulDivOpSize(a.Target, a.Operand, a.Target);
+                    if (size <= 2) RecordMulDiv(a.Op, size);
+                    break;
+                }
+                case ArrayLoad al when al.Index is not Constant && al.ElemType.SizeOf() == 2:
+                case ArrayStore ast when ast.Index is not Constant && ast.ElemType.SizeOf() == 2:
+                    _needsArrIdxScale = true;
+                    break;
+            }
+        }
+    }
+
+    private void EmitScratchSymbols()
+    {
+        if (!NeedsMulDivScratch && !_needsArrIdxScale) return;
+
+        EmitComment("--- Common-RAM scratch (bank-independent) ---");
+        if (NeedsMulDivScratch)
+        {
+            _symbolTable[ScratchA] = _scratchBase + 0;
+            _symbolTable[ScratchB] = _scratchBase + 2;
+            _symbolTable[ScratchR] = _scratchBase + 4;
+            _symbolTable[ScratchC] = _scratchBase + 6;
+            EmitRaw($"{ScratchA} EQU 0x{_scratchBase + 0:X2}");
+            EmitRaw($"{ScratchB} EQU 0x{_scratchBase + 2:X2}");
+            EmitRaw($"{ScratchR} EQU 0x{_scratchBase + 4:X2}");
+            EmitRaw($"{ScratchC} EQU 0x{_scratchBase + 6:X2}");
+        }
+
+        if (_needsArrIdxScale)
+        {
+            _symbolTable[ScratchIdx] = _scratchBase + 7;
+            EmitRaw($"{ScratchIdx} EQU 0x{_scratchBase + 7:X2}");
+        }
+
+        EmitRaw("");
+    }
+
+    // Loads a 1- or 2-byte value into a 16-bit scratch cell (zero-extending
+    // 8-bit sources). Scratch cells are in common RAM: no bank select needed.
+    private void LoadScratch16(string cell, Val src)
+    {
+        if (src is Constant c)
+        {
+            int v = c.Value;
+            Emit("MOVLW", $"0x{v & 0xFF:X2}");
+            Emit("MOVWF", cell);
+            if (((v >> 8) & 0xFF) == 0)
+            {
+                Emit("CLRF", cell + "+1");
+            }
+            else
+            {
+                Emit("MOVLW", $"0x{(v >> 8) & 0xFF:X2}");
+                Emit("MOVWF", cell + "+1");
+            }
+
+            return;
+        }
+
+        LoadIntoW(src);
+        Emit("MOVWF", cell);
+        if (GetValSize(src) >= 2)
+        {
+            string lo = ResolveAddress(src);
+            string hi = HighByteOperand(lo);
+            SelectBank(hi);
+            Emit("MOVF", hi, "W");
+            Emit("MOVWF", cell + "+1");
+        }
+        else
+        {
+            Emit("CLRF", cell + "+1");
+        }
+    }
+
+    private void CompileMulDivMod(Binary arg)
+    {
+        int opSize = MulDivOpSize(arg.Src1, arg.Src2, arg.Dst);
+        if (opSize > 2)
+            throw new NotSupportedException(
+                "PIC14: Mul/Div/Mod wider than 16 bits is not supported");
+
+        bool isMul = arg.Op == IrBinOp.Mul;
+        bool isMod = arg.Op == IrBinOp.Mod;
+        RecordMulDiv(arg.Op, opSize); // defensive; the pre-scan already did this
+
+        if (opSize == 1)
+        {
+            LoadIntoW(arg.Src1);
+            Emit("MOVWF", ScratchA);
+            LoadIntoW(arg.Src2);
+            Emit("MOVWF", ScratchB);
+            Emit("CALL", isMul ? "__mul8" : "__div8");
+            // __mul8: product in __m_r. __div8: quotient in __m_a, remainder in __m_r.
+            Emit("MOVF", isMul || isMod ? ScratchR : ScratchA, "W");
+            StoreWInto(arg.Dst);
+            return;
+        }
+
+        LoadScratch16(ScratchA, arg.Src1);
+        LoadScratch16(ScratchB, arg.Src2);
+        Emit("CALL", isMul ? "__mul16" : "__div16");
+        string res = isMul || isMod ? ScratchR : ScratchA;
+
+        Emit("MOVF", res, "W");
+        StoreWInto(arg.Dst); // low byte
+        if (GetValSize(arg.Dst) == 2)
+        {
+            string dstHi = HighByteOperand(ResolveAddress(arg.Dst));
+            Emit("MOVF", res + "+1", "W");
+            SelectBank(dstHi);
+            Emit("MOVWF", dstHi);
+        }
+    }
+
+    // Routines operate exclusively on common-RAM scratch cells and STATUS, so
+    // they are callable from any bank and never emit bank selects themselves.
+    private void EmitSoftwareRoutines()
+    {
+        if (_needsMul8)
+        {
+            EmitComment("--- __mul8: __m_r = __m_a * __m_b (8x8 -> 8, shift-add) ---");
+            EmitLabel("__mul8");
+            Emit("CLRF", ScratchR);
+            EmitLabel("__mul8_loop");
+            Emit("MOVF", ScratchB, "F");
+            Emit("BTFSC", "STATUS", "2");
+            Emit("RETURN");
+            Emit("BTFSS", ScratchB, "0");
+            Emit("GOTO", "__mul8_skip");
+            Emit("MOVF", ScratchA, "W");
+            Emit("ADDWF", ScratchR, "F");
+            EmitLabel("__mul8_skip");
+            Emit("BCF", "STATUS", "0");
+            Emit("RLF", ScratchA, "F");
+            Emit("BCF", "STATUS", "0");
+            Emit("RRF", ScratchB, "F");
+            Emit("GOTO", "__mul8_loop");
+        }
+
+        if (_needsDiv8)
+        {
+            EmitComment("--- __div8: __m_a = __m_a / __m_b, __m_r = remainder (restoring) ---");
+            EmitLabel("__div8");
+            Emit("CLRF", ScratchR);
+            Emit("MOVLW", "0x08");
+            Emit("MOVWF", ScratchC);
+            EmitLabel("__div8_loop");
+            Emit("BCF", "STATUS", "0");
+            Emit("RLF", ScratchA, "F");
+            Emit("RLF", ScratchR, "F");
+            Emit("BTFSC", "STATUS", "0"); // 9th remainder bit -> subtract for sure
+            Emit("GOTO", "__div8_sub");
+            Emit("MOVF", ScratchB, "W");
+            Emit("SUBWF", ScratchR, "W");
+            Emit("BTFSS", "STATUS", "0"); // C=0 -> remainder < divisor
+            Emit("GOTO", "__div8_next");
+            EmitLabel("__div8_sub");
+            Emit("MOVF", ScratchB, "W");
+            Emit("SUBWF", ScratchR, "F");
+            Emit("BSF", ScratchA, "0");   // quotient bit (shifted into __m_a's LSB)
+            EmitLabel("__div8_next");
+            Emit("DECFSZ", ScratchC, "F");
+            Emit("GOTO", "__div8_loop");
+            Emit("RETURN");
+        }
+
+        if (_needsMul16)
+        {
+            EmitComment("--- __mul16: __m_r = __m_a * __m_b (16x16 -> 16, shift-add) ---");
+            EmitLabel("__mul16");
+            Emit("CLRF", ScratchR);
+            Emit("CLRF", ScratchR + "+1");
+            EmitLabel("__mul16_loop");
+            Emit("MOVF", ScratchB, "W");
+            Emit("IORWF", ScratchB + "+1", "W");
+            Emit("BTFSC", "STATUS", "2");
+            Emit("RETURN");
+            Emit("BTFSS", ScratchB, "0");
+            Emit("GOTO", "__mul16_skip");
+            Emit("MOVF", ScratchA, "W");
+            Emit("ADDWF", ScratchR, "F");
+            Emit("BTFSC", "STATUS", "0");
+            Emit("INCF", ScratchR + "+1", "F");
+            Emit("MOVF", ScratchA + "+1", "W");
+            Emit("ADDWF", ScratchR + "+1", "F");
+            EmitLabel("__mul16_skip");
+            Emit("BCF", "STATUS", "0");
+            Emit("RLF", ScratchA, "F");
+            Emit("RLF", ScratchA + "+1", "F");
+            Emit("BCF", "STATUS", "0");
+            Emit("RRF", ScratchB + "+1", "F");
+            Emit("RRF", ScratchB, "F");
+            Emit("GOTO", "__mul16_loop");
+        }
+
+        if (_needsDiv16)
+        {
+            EmitComment("--- __div16: __m_a = __m_a / __m_b, __m_r = remainder (restoring) ---");
+            EmitLabel("__div16");
+            Emit("CLRF", ScratchR);
+            Emit("CLRF", ScratchR + "+1");
+            Emit("MOVLW", "0x10");
+            Emit("MOVWF", ScratchC);
+            EmitLabel("__div16_loop");
+            Emit("BCF", "STATUS", "0");
+            Emit("RLF", ScratchA, "F");
+            Emit("RLF", ScratchA + "+1", "F");
+            Emit("RLF", ScratchR, "F");
+            Emit("RLF", ScratchR + "+1", "F");
+            Emit("BTFSC", "STATUS", "0"); // 17th remainder bit -> subtract for sure
+            Emit("GOTO", "__div16_sub");
+            Emit("MOVF", ScratchB + "+1", "W");
+            Emit("SUBWF", ScratchR + "+1", "W");
+            Emit("BTFSS", "STATUS", "2"); // high bytes differ -> carry decides
+            Emit("GOTO", "__div16_chk");
+            Emit("MOVF", ScratchB, "W");  // high bytes equal -> compare low bytes
+            Emit("SUBWF", ScratchR, "W");
+            EmitLabel("__div16_chk");
+            Emit("BTFSS", "STATUS", "0"); // C=0 -> remainder < divisor
+            Emit("GOTO", "__div16_next");
+            EmitLabel("__div16_sub");
+            Emit("MOVF", ScratchB, "W");
+            Emit("SUBWF", ScratchR, "F");
+            Emit("BTFSS", "STATUS", "0");
+            Emit("DECF", ScratchR + "+1", "F");
+            Emit("MOVF", ScratchB + "+1", "W");
+            Emit("SUBWF", ScratchR + "+1", "F");
+            Emit("BSF", ScratchA, "0");   // quotient bit (shifted into __m_a's LSB)
+            EmitLabel("__div16_next");
+            Emit("DECFSZ", ScratchC, "F");
+            Emit("GOTO", "__div16_loop");
+            Emit("RETURN");
+        }
+    }
+
+    // --- Error propagation (T-flag model, PIC14 flavor) ------------------------
+    //
+    // PIC14 has no spare CPU flag that survives across CALL/RETURN, so the
+    // error channel is a RAM cell: __err == 0 means success, nonzero holds the
+    // error code. CanFail functions clear it on the happy path (SignalSuccess)
+    // and callers test it right after the CALL (BranchOnError). An uncaught
+    // error in main cannot RETURN (main is entered via GOTO from the reset
+    // vector), so it parks in the __err_trap idle loop instead.
+
+    private bool _needsErrTrap;
+
+    private void CompileVariant(SignalError arg)
+    {
+        string err = GetOrAllocVariable("__err");
+        SelectBank(err);
+        LoadIntoW(arg.Code);
+        Emit("MOVWF", err);
+        if (arg.CatchLabel != null)
+        {
+            Emit("GOTO", arg.CatchLabel);
+        }
+        else if (_currentFunctionName == "main")
+        {
+            _needsErrTrap = true;
+            Emit("GOTO", "__err_trap");
+        }
+        else
+        {
+            Emit("RETURN"); // propagate to the caller's BranchOnError
+        }
+
+        _currentBlockTerminated = true;
+    }
+
+    private void CompileVariant(SignalSuccess arg)
+    {
+        string err = GetOrAllocVariable("__err");
+        SelectBank(err);
+        Emit("CLRF", err);
+    }
+
+    private void CompileVariant(BranchOnError arg)
+    {
+        string err = GetOrAllocVariable("__err");
+        SelectBank(err);
+        Emit("MOVF", err, "F");       // Z = (__err == 0)
+        Emit("BTFSS", "STATUS", "2"); // Z set (no error) -> skip the branch
+        Emit("GOTO", arg.ErrorLabel);
+    }
+
+    // --- Arrays (RAM, direct or FSR/INDF) -------------------------------------
+
+    private string HighByteOperand(string lo) =>
+        lo.StartsWith("0x") ? $"0x{ParseHexAddr(lo) + 1:X2}" : lo + "+1";
+
+    private string OffsetOperand(string baseOp, int offset)
+    {
+        if (offset == 0) return baseOp;
+        return baseOp.StartsWith("0x")
+            ? $"0x{ParseHexAddr(baseOp) + offset:X2}"
+            : baseOp + "+" + offset;
+    }
+
+    private string ArrayBaseOperand(string arrayName)
+    {
+        if (_stackLayout.ContainsKey(arrayName) || _symbolTable.ContainsKey(arrayName))
+            return arrayName;
+        // The StackAllocator registers every array it sees (locals and globals),
+        // so a miss means the IR referenced an array with no storage.
+        throw new InvalidOperationException(
+            $"PIC14: array '{arrayName}' has no allocated storage");
+    }
+
+    private void CheckConstIndex(string arrayName, int index, int count)
+    {
+        if (index < 0 || index >= count)
+            throw new InvalidOperationException(
+                $"PIC14: constant index {index} is out of bounds for array " +
+                $"'{arrayName}' of length {count}");
+    }
+
+    // Leaves FSR pointing at &array[index] (scaled by element size). All PIC14
+    // arrays live in bank 0 (< 0x100), so IRP is force-cleared.
+    private void EmitArrayElementFsr(string arrayName, Val index, int elemSize)
+    {
+        string baseOp = ArrayBaseOperand(arrayName);
+        if (elemSize == 2)
+        {
+            LoadIntoW(index);
+            Emit("MOVWF", ScratchIdx);
+            Emit("BCF", "STATUS", "0");
+            Emit("RLF", ScratchIdx, "F"); // index * 2
+            Emit("MOVF", ScratchIdx, "W");
+        }
+        else
+        {
+            LoadIntoW(index);
+        }
+
+        Emit("ADDLW", baseOp);            // W = &array[0] + scaled index
+        Emit("MOVWF", "FSR");
+        Emit("BCF", "STATUS", "7");       // IRP = 0
+    }
+
+    private void CompileVariant(ArrayLoad arg)
+    {
+        int elemSize = arg.ElemType.SizeOf();
+        if (elemSize > 2)
+            throw new NotSupportedException(
+                "PIC14: array elements wider than 16 bits are not supported");
+
+        int dstSize = GetValSize(arg.Dst);
+
+        if (arg.Index is Constant ci)
+        {
+            CheckConstIndex(arg.ArrayName, ci.Value, arg.Count);
+            string baseOp = ArrayBaseOperand(arg.ArrayName);
+            string lo = OffsetOperand(baseOp, ci.Value * elemSize);
+            SelectBank(lo);
+            Emit("MOVF", lo, "W");
+            StoreWInto(arg.Dst);
+            if (dstSize == 2)
+            {
+                string dstHi = HighByteOperand(ResolveAddress(arg.Dst));
+                if (elemSize == 2)
+                {
+                    string hi = OffsetOperand(baseOp, ci.Value * elemSize + 1);
+                    SelectBank(hi);
+                    Emit("MOVF", hi, "W");
+                    SelectBank(dstHi);
+                    Emit("MOVWF", dstHi);
+                }
+                else
+                {
+                    SelectBank(dstHi);
+                    Emit("CLRF", dstHi); // zero-extend byte element into 16-bit dst
+                }
+            }
+
+            return;
+        }
+
+        EmitArrayElementFsr(arg.ArrayName, arg.Index, elemSize);
+        Emit("MOVF", "INDF", "W");
+        StoreWInto(arg.Dst);
+        if (dstSize == 2)
+        {
+            string dstHi = HighByteOperand(ResolveAddress(arg.Dst));
+            if (elemSize == 2)
+            {
+                Emit("INCF", "FSR", "F");
+                Emit("MOVF", "INDF", "W");
+                SelectBank(dstHi);
+                Emit("MOVWF", dstHi);
+            }
+            else
+            {
+                SelectBank(dstHi);
+                Emit("CLRF", dstHi);
+            }
+        }
+    }
+
+    private void CompileVariant(ArrayStore arg)
+    {
+        int elemSize = arg.ElemType.SizeOf();
+        if (elemSize > 2)
+            throw new NotSupportedException(
+                "PIC14: array elements wider than 16 bits are not supported");
+        if (arg.Src is FunctionRef)
+            throw new NotSupportedException(
+                "PIC14: Callable arrays are not supported");
+
+        if (arg.Index is Constant ci)
+        {
+            CheckConstIndex(arg.ArrayName, ci.Value, arg.Count);
+            string baseOp = ArrayBaseOperand(arg.ArrayName);
+            string lo = OffsetOperand(baseOp, ci.Value * elemSize);
+            LoadIntoW(arg.Src);
+            SelectBank(lo);
+            Emit("MOVWF", lo);
+            if (elemSize == 2)
+            {
+                string hi = OffsetOperand(baseOp, ci.Value * elemSize + 1);
+                if (arg.Src is Constant sc)
+                {
+                    int hv = (sc.Value >> 8) & 0xFF;
+                    SelectBank(hi);
+                    if (hv == 0)
+                    {
+                        Emit("CLRF", hi);
+                    }
+                    else
+                    {
+                        Emit("MOVLW", $"0x{hv:X2}");
+                        Emit("MOVWF", hi);
+                    }
+                }
+                else if (GetValSize(arg.Src) >= 2)
+                {
+                    string srcHi = HighByteOperand(ResolveAddress(arg.Src));
+                    SelectBank(srcHi);
+                    Emit("MOVF", srcHi, "W");
+                    SelectBank(hi);
+                    Emit("MOVWF", hi);
+                }
+                else
+                {
+                    SelectBank(hi);
+                    Emit("CLRF", hi);
+                }
+            }
+
+            return;
+        }
+
+        EmitArrayElementFsr(arg.ArrayName, arg.Index, elemSize);
+        LoadIntoW(arg.Src);
+        Emit("MOVWF", "INDF");
+        if (elemSize == 2)
+        {
+            Emit("INCF", "FSR", "F");
+            if (arg.Src is Constant sc2)
+            {
+                int hv = (sc2.Value >> 8) & 0xFF;
+                if (hv == 0)
+                {
+                    Emit("CLRF", "INDF");
+                }
+                else
+                {
+                    Emit("MOVLW", $"0x{hv:X2}");
+                    Emit("MOVWF", "INDF");
+                }
+            }
+            else if (GetValSize(arg.Src) >= 2)
+            {
+                string srcHi = HighByteOperand(ResolveAddress(arg.Src));
+                SelectBank(srcHi);
+                Emit("MOVF", srcHi, "W");
+                Emit("MOVWF", "INDF");
+            }
+            else
+            {
+                Emit("CLRF", "INDF");
+            }
         }
     }
 
@@ -627,19 +1202,27 @@ public class PIC14CodeGen : CodeGen
             else
             {
                 string srcLo = ResolveAddress(arg.Src);
-                string srcHi = srcLo.StartsWith("0x")
-                    ? $"0x{ParseHexAddr(srcLo) + 1:X2}"
-                    : srcLo + "+1";
 
                 SelectBank(srcLo);
                 Emit("MOVF", srcLo, "W");
                 SelectBank(dstLo);
                 Emit("MOVWF", dstLo);
 
-                SelectBank(srcHi);
-                Emit("MOVF", srcHi, "W");
-                SelectBank(dstHi);
-                Emit("MOVWF", dstHi);
+                if (GetValSize(arg.Src) >= 2)
+                {
+                    string srcHi = HighByteOperand(srcLo);
+                    SelectBank(srcHi);
+                    Emit("MOVF", srcHi, "W");
+                    SelectBank(dstHi);
+                    Emit("MOVWF", dstHi);
+                }
+                else
+                {
+                    // Widening copy from an 8-bit source: zero-extend instead of
+                    // reading src+1 (which is the NEXT variable's slot).
+                    SelectBank(dstHi);
+                    Emit("CLRF", dstHi);
+                }
             }
 
             return;
@@ -757,18 +1340,18 @@ public class PIC14CodeGen : CodeGen
         StoreWInto(arg.Dst);
     }
 
+    // Operand size in bytes, resolved through the allocator's size table.
+    private int GetValSize(Val val)
+    {
+        if (val is Variable v && _varSizes.ContainsKey(v.Name)) return _varSizes[v.Name];
+        if (val is Temporary t && _varSizes.ContainsKey(t.Name)) return _varSizes[t.Name];
+        if (val is MemoryAddress m && m.Type == DataType.UINT16) return 2;
+        if (val is Constant c && (c.Value > 255 || c.Value < 0)) return 2;
+        return 1;
+    }
+
     private void CompileVariant(Binary arg)
     {
-        // Determine operation size
-        int GetValSize(Val val)
-        {
-            if (val is Variable v && _varSizes.ContainsKey(v.Name)) return _varSizes[v.Name];
-            if (val is Temporary t && _varSizes.ContainsKey(t.Name)) return _varSizes[t.Name];
-            if (val is MemoryAddress m && m.Type == DataType.UINT16) return 2;
-            if (val is Constant c && (c.Value > 255 || c.Value < 0)) return 2;
-            return 1;
-        }
-
         bool isComparison = arg.Op switch
         {
             IrBinOp.Equal or IrBinOp.NotEqual or IrBinOp.LessThan or
@@ -800,6 +1383,13 @@ public class PIC14CodeGen : CodeGen
             }
 
             throw new NotSupportedException("PIC14: Float op not supported (only Add)");
+        }
+
+        // --- Multiply / Divide / Modulo (software routines) ---
+        if (IsMulDivOp(arg.Op))
+        {
+            CompileMulDivMod(arg);
+            return;
         }
 
         // --- 16-bit Implementation ---
@@ -1442,6 +2032,14 @@ public class PIC14CodeGen : CodeGen
 
     private void CompileVariant(AugAssign arg)
     {
+        // target op= operand for mul/div/mod: lower onto the Binary path — the
+        // scratch-cell calling convention is alias-safe (dst == src is fine).
+        if (IsMulDivOp(arg.Op))
+        {
+            CompileMulDivMod(new Binary(arg.Op, arg.Target, arg.Operand, arg.Target));
+            return;
+        }
+
         string targetAddr = ResolveAddress(arg.Target);
         string targetAddrHi = targetAddr;
 
