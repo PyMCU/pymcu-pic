@@ -2067,45 +2067,38 @@ public class PIC14CodeGen : CodeGen
         // --- 8-bit ---
         if (size == 1)
         {
-            SelectBank(targetAddr);
+            // Load the operand FIRST (it may bank-select, e.g. a bank-1 SFR),
+            // then select the target's bank for the read-modify-write.
             LoadIntoW(arg.Operand);
 
             switch (arg.Op)
             {
-                case IrBinOp.Add: Emit("ADDWF", targetAddr, "F"); break;
-                case IrBinOp.Sub: Emit("SUBWF", targetAddr, "F"); break;
-                case IrBinOp.BitAnd: Emit("ANDWF", targetAddr, "F"); break;
-                case IrBinOp.BitOr: Emit("IORWF", targetAddr, "F"); break;
-                case IrBinOp.BitXor: Emit("XORWF", targetAddr, "F"); break;
+                case IrBinOp.Add: SelectBank(targetAddr); Emit("ADDWF", targetAddr, "F"); break;
+                case IrBinOp.Sub: SelectBank(targetAddr); Emit("SUBWF", targetAddr, "F"); break;
+                case IrBinOp.BitAnd: SelectBank(targetAddr); Emit("ANDWF", targetAddr, "F"); break;
+                case IrBinOp.BitOr: SelectBank(targetAddr); Emit("IORWF", targetAddr, "F"); break;
+                case IrBinOp.BitXor: SelectBank(targetAddr); Emit("XORWF", targetAddr, "F"); break;
                 case IrBinOp.LShift:
-                {
-                    string loopLbl = MakeLabel("augls");
-                    string doneLbl = MakeLabel("augls_done");
-                    GetOrAllocVariable("__tmp");
-                    Emit("MOVWF", "__tmp");
-                    Emit("MOVF", "__tmp", "F");
-                    Emit("BTFSC", "STATUS", "2");
-                    Emit("GOTO", doneLbl);
-                    EmitLabel(loopLbl);
-                    Emit("BCF", "STATUS", "0");
-                    Emit("RLF", targetAddr, "F");
-                    Emit("DECFSZ", "__tmp", "F");
-                    Emit("GOTO", loopLbl);
-                    EmitLabel(doneLbl);
-                    break;
-                }
                 case IrBinOp.RShift:
                 {
-                    string loopLbl = MakeLabel("augrs");
-                    string doneLbl = MakeLabel("augrs_done");
+                    // Shift loop: __tmp (bank-0 counter) and the target may live
+                    // in different banks, so every access is bank-selected. The
+                    // bank state at the backedge equals the state at the loop
+                    // head (bank of __tmp), keeping the linear tracker consistent.
+                    string rotateOp = arg.Op == IrBinOp.LShift ? "RLF" : "RRF";
+                    string loopLbl = MakeLabel(arg.Op == IrBinOp.LShift ? "augls" : "augrs");
+                    string doneLbl = loopLbl + "_done";
                     GetOrAllocVariable("__tmp");
+                    SelectBank("__tmp");
                     Emit("MOVWF", "__tmp");
                     Emit("MOVF", "__tmp", "F");
                     Emit("BTFSC", "STATUS", "2");
                     Emit("GOTO", doneLbl);
                     EmitLabel(loopLbl);
                     Emit("BCF", "STATUS", "0");
-                    Emit("RRF", targetAddr, "F");
+                    SelectBank(targetAddr);
+                    Emit(rotateOp, targetAddr, "F");
+                    SelectBank("__tmp");
                     Emit("DECFSZ", "__tmp", "F");
                     Emit("GOTO", loopLbl);
                     EmitLabel(doneLbl);
@@ -2257,45 +2250,44 @@ public class PIC14CodeGen : CodeGen
                 return;
             }
 
-            // 4. LShift 16-bit
-            if (arg.Op == IrBinOp.LShift)
+            // 4./5. Shift 16-bit. __tmp (bank-0 counter) and the target can be
+            // in different banks (e.g. `x <<= TRISC.value` loads the count with
+            // bank 1 selected), so every access is bank-selected. The bank state
+            // at the backedge equals the state at the loop head (bank of __tmp),
+            // keeping the linear bank tracker consistent. Note the TARGET can
+            // never live outside bank 0 today (the bump allocator is bank-0-only
+            // and throws on overflow), but the SelectBank calls cost nothing in
+            // that case and keep this correct if banked allocation ever lands.
+            if (arg.Op == IrBinOp.LShift || arg.Op == IrBinOp.RShift)
             {
-                string loopLbl = MakeLabel("augls16");
-                string doneLbl = MakeLabel("augls16_done");
+                bool left = arg.Op == IrBinOp.LShift;
+                string loopLbl = MakeLabel(left ? "augls16" : "augrs16");
+                string doneLbl = loopLbl + "_done";
                 LoadIntoW(arg.Operand);
                 GetOrAllocVariable("__tmp");
+                SelectBank("__tmp");
                 Emit("MOVWF", "__tmp");
                 EmitLabel(loopLbl);
                 Emit("MOVF", "__tmp", "F");
                 Emit("BTFSC", "STATUS", "2");
                 Emit("GOTO", doneLbl);
                 Emit("BCF", "STATUS", "0");
-                SelectBank(targetAddr);
-                Emit("RLF", targetAddr, "F");
-                SelectBank(targetAddrHi);
-                Emit("RLF", targetAddrHi, "F");
-                Emit("DECF", "__tmp", "F");
-                Emit("GOTO", loopLbl);
-                EmitLabel(doneLbl);
-                return;
-            }
+                if (left)
+                {
+                    SelectBank(targetAddr);
+                    Emit("RLF", targetAddr, "F");
+                    SelectBank(targetAddrHi);
+                    Emit("RLF", targetAddrHi, "F");
+                }
+                else
+                {
+                    SelectBank(targetAddrHi);
+                    Emit("RRF", targetAddrHi, "F");
+                    SelectBank(targetAddr);
+                    Emit("RRF", targetAddr, "F");
+                }
 
-            // 5. RShift 16-bit
-            if (arg.Op == IrBinOp.RShift)
-            {
-                string loopLbl = MakeLabel("augrs16");
-                string doneLbl = MakeLabel("augrs16_done");
-                LoadIntoW(arg.Operand);
-                Emit("MOVWF", "__tmp");
-                EmitLabel(loopLbl);
-                Emit("MOVF", "__tmp", "F");
-                Emit("BTFSC", "STATUS", "2");
-                Emit("GOTO", doneLbl);
-                Emit("BCF", "STATUS", "0");
-                SelectBank(targetAddrHi);
-                Emit("RRF", targetAddrHi, "F");
-                SelectBank(targetAddr);
-                Emit("RRF", targetAddr, "F");
+                SelectBank("__tmp");
                 Emit("DECF", "__tmp", "F");
                 Emit("GOTO", loopLbl);
                 EmitLabel(doneLbl);
