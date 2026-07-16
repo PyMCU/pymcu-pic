@@ -1927,25 +1927,36 @@ public class PIC14CodeGen : CodeGen
                 }
                 else
                 {
-                    // Variable shift
+                    // Variable shift. The count is copied into the __tmp scratch
+                    // cell BEFORE the loop: DECFSZ on the count variable itself
+                    // destroyed the user's variable (y = x << n left n == 0).
+                    // Copying first also keeps `n = x << n` correct (dst would
+                    // clobber the count before the loop read it). Same bank
+                    // discipline as the AugAssign shift loops: every __tmp/dst
+                    // access is bank-selected and the backedge bank state equals
+                    // the loop head's.
+                    string loopLabel = MakeLabel("shift");
+                    string doneLabel = MakeLabel("shift_done");
+
+                    GetOrAllocVariable("__tmp");
+                    LoadIntoW(arg.Src2);
+                    SelectBank("__tmp");
+                    Emit("MOVWF", "__tmp");
+
                     LoadIntoW(arg.Src1);
                     StoreWInto(arg.Dst);
 
                     string dstAddr = ResolveAddress(arg.Dst);
-                    string countAddr = ResolveAddress(arg.Src2);
-                    string loopLabel = MakeLabel("shift");
-                    string doneLabel = MakeLabel("shift_done");
-
-                    SelectBank(countAddr);
-                    Emit("MOVF", countAddr, "W");
+                    SelectBank("__tmp");
+                    Emit("MOVF", "__tmp", "F");
                     Emit("BTFSC", "STATUS", "2");
                     Emit("GOTO", doneLabel);
                     EmitLabel(loopLabel);
                     Emit("BCF", "STATUS", "0");
                     SelectBank(dstAddr);
                     Emit(rotateOp, dstAddr, "F");
-                    SelectBank(countAddr);
-                    Emit("DECFSZ", countAddr, "F");
+                    SelectBank("__tmp");
+                    Emit("DECFSZ", "__tmp", "F");
                     Emit("GOTO", loopLabel);
                     EmitLabel(doneLabel);
                 }
