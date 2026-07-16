@@ -57,8 +57,12 @@ public static class PymcuCompiler
     /// throwaway project under the system temp directory and built with <c>pymcu build</c>.
     /// Cached by content hash so identical programs compile once.
     /// </summary>
-    public static string BuildSource(string mainPy)
-        => Cache.GetOrAdd("src:" + Sha(mainPy), _ => new Lazy<string>(() => CompileSource(mainPy))).Value;
+    /// <param name="mainPy">The program source.</param>
+    /// <param name="target">Target chip (default: the CI reference PIC16F877A).</param>
+    /// <param name="frequencyHz">Oscillator frequency in Hz (default: 20 MHz).</param>
+    public static string BuildSource(string mainPy, string target = "pic16f877a", int frequencyHz = 20_000_000)
+        => Cache.GetOrAdd($"src:{target}:{frequencyHz}:{Sha(mainPy)}",
+            _ => new Lazy<string>(() => CompileSource(mainPy, target, frequencyHz))).Value;
 
     private static string Sha(string s)
     {
@@ -66,9 +70,10 @@ public static class PymcuCompiler
         return Convert.ToHexString(bytes);
     }
 
-    private static string CompileSource(string mainPy)
+    private static string CompileSource(string mainPy, string target, int frequencyHz)
     {
-        var dir = Path.Combine(Path.GetTempPath(), "pymcu-gen", Sha(mainPy)[..16]);
+        var key = Sha($"{target}:{frequencyHz}:{mainPy}");
+        var dir = Path.Combine(Path.GetTempPath(), "pymcu-gen", key[..16]);
         Directory.CreateDirectory(Path.Combine(dir, "src"));
         File.WriteAllText(Path.Combine(dir, "pyproject.toml"),
             "[project]\n" +
@@ -77,12 +82,12 @@ public static class PymcuCompiler
             "requires-python = \">=3.11\"\n" +
             "dependencies = [\"pymcu-stdlib>=0.1.2a5\", \"pymcu>=0.1.0a27\"]\n\n" +
             "[tool.pymcu]\n" +
-            "target = \"pic16f877a\"\n" +
-            "frequency = 20000000\n" +
+            $"target = \"{target}\"\n" +
+            $"frequency = {frequencyHz}\n" +
             "sources = \"src\"\n" +
             "entry = \"main.py\"\n");
         File.WriteAllText(Path.Combine(dir, "src", "main.py"), mainPy);
-        return Compile(dir, "gen-" + Sha(mainPy)[..8]);
+        return Compile(dir, "gen-" + key[..8]);
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
