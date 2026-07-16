@@ -2191,9 +2191,6 @@ public class PIC14CodeGen : CodeGen
                     //   if carry: target_hi++
                     //   W = operand_hi; target_hi += W
                     string opAddr = ResolveAddress(arg.Operand);
-                    string opAddrHi = opAddr.StartsWith("0x")
-                        ? $"0x{ParseHexAddr(opAddr) + 1:X2}"
-                        : opAddr + "+1";
                     SelectBank(opAddr);
                     Emit("MOVF", opAddr, "W");
                     SelectBank(targetAddr);
@@ -2201,10 +2198,17 @@ public class PIC14CodeGen : CodeGen
                     SelectBank(targetAddrHi);
                     Emit("BTFSC", "STATUS", "0");
                     Emit("INCF", targetAddrHi, "F");
-                    SelectBank(opAddrHi);
-                    Emit("MOVF", opAddrHi, "W");
-                    SelectBank(targetAddrHi);
-                    Emit("ADDWF", targetAddrHi, "F");
+                    if (GetValSize(arg.Operand) >= 2)
+                    {
+                        string opAddrHi = HighByteOperand(opAddr);
+                        SelectBank(opAddrHi);
+                        Emit("MOVF", opAddrHi, "W");
+                        SelectBank(targetAddrHi);
+                        Emit("ADDWF", targetAddrHi, "F");
+                    }
+                    // 8-bit operand: high byte is zero — the carry INCF above
+                    // already completed the add. Reading operand+1 here would
+                    // read the NEXT variable's RAM slot (same bug fixed in Copy).
                 }
 
                 return;
@@ -2238,17 +2242,17 @@ public class PIC14CodeGen : CodeGen
                     Emit("MOVLW", $"0x{valHi:X2}");
                     Emit("SUBWF", targetAddrHi, "F");
                 }
-                else
+                else if (GetValSize(arg.Operand) >= 2)
                 {
-                    if (arg.Operand is Variable opVar)
-                    {
-                        string opHi = opVar.Name + "+1";
-                        SelectBank(opHi);
-                        Emit("MOVF", opHi, "W");
-                        SelectBank(targetAddrHi);
-                        Emit("SUBWF", targetAddrHi, "F");
-                    }
+                    string opHi = HighByteOperand(ResolveAddress(arg.Operand));
+                    SelectBank(opHi);
+                    Emit("MOVF", opHi, "W");
+                    SelectBank(targetAddrHi);
+                    Emit("SUBWF", targetAddrHi, "F");
                 }
+                // 8-bit operand: high byte is zero — the borrow DECF above
+                // already completed the subtract. Reading operand+1 would read
+                // the NEXT variable's RAM slot (same bug fixed in Copy).
 
                 return;
             }
