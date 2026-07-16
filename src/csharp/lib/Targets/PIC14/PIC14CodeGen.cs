@@ -59,6 +59,23 @@ public class PIC14CodeGen : CodeGen
     private string ScratchC => "__m_c";   // 1 byte : div bit counter
     private string ScratchIdx => "__arr_i"; // 1 byte: scaled array index (16-bit elements)
 
+    // --- Flash tables (const[str] / const[uint8[N]]) -------------------------
+    //
+    // Midrange PIC14 program memory is not data-addressable, so flash-resident
+    // byte tables lower to RETLW lists reached through a computed GOTO: the
+    // caller loads PCLATH with the high byte of the entry address and CALLs the
+    // table, whose prologue adds the low byte of the first entry to the index
+    // in W (propagating the ADDLW carry into PCLATH) and writes W to PCL. The
+    // RETLW at the landing entry returns its literal to the CALLer. Tables are
+    // emitted at the END of the program, after the software routines, and every
+    // page-sensitive assumption is asserted at assembly time (IF/ERROR).
+    private readonly List<(string Name, List<int> Bytes)> _flashData = new();
+    private readonly HashSet<string> _flashDataNames = new();
+    private bool _needsFlashJmp;
+    private Dictionary<string, Function> _funcByName = new();
+
+    private static string FlashLabel(string name) => "__flash_" + name.Replace('.', '_');
+
     public PIC14CodeGen(DeviceConfig cfg)
     {
         Config = cfg;
@@ -314,6 +331,10 @@ public class PIC14CodeGen : CodeGen
     public override void Compile(ProgramIR program, TextWriter output)
     {
         _assembly.Clear();
+        _flashData.Clear();
+        _flashDataNames.Clear();
+        _needsFlashJmp = false;
+        _funcByName = program.Functions.ToDictionary(f => f.Name);
 
         // Make labels defined inside @inline asm() blocks unique per expansion
         // (a HAL delay loop inlined twice would otherwise duplicate its label).
@@ -504,6 +525,9 @@ public class PIC14CodeGen : CodeGen
             Emit("GOTO", "__err_trap");
         }
 
+        // Flash RETLW tables (const[str] / const[uint8[N]]), at the very end.
+        EmitFlashTables();
+
         if (_usesFloat)
             EmitRaw("#include \"float.inc\"");
 
@@ -588,6 +612,9 @@ public class PIC14CodeGen : CodeGen
             case Call arg: CompileVariant(arg); break;
             case ArrayLoad arg: CompileVariant(arg); break;
             case ArrayStore arg: CompileVariant(arg); break;
+            case FlashData arg: CompileVariant(arg); break;
+            case ArrayLoadFlash arg: CompileVariant(arg); break;
+            case FlashLoadPtr arg: CompileVariant(arg); break;
             case SignalError arg: CompileVariant(arg); break;
             case SignalSuccess arg: CompileVariant(arg); break;
             case BranchOnError arg: CompileVariant(arg); break;
@@ -1123,6 +1150,134 @@ public class PIC14CodeGen : CodeGen
         }
     }
 
+    // --- Flash tables (RETLW + computed GOTO) ----------------------------------
+    //
+    // Layout of every table (see the field comments near _flashData):
+    //
+    //   __flash_x:                      ; CALL target (index in W, PCLATH = HIGH(__flash_x_t))
+    //       ADDLW LOW(__flash_x_t)      ; W = low byte of entry address
+    //       BTFSC STATUS, 0
+    //       INCF  PCLATH, F             ; carry of the ADDLW into the high byte
+    //       MOVWF PCL                   ; PC = PCLATH<4:0>:W -> lands on the entry
+    //   __flash_x_t:
+    //       RETLW 0x..                  ; entry 0 (returns to the CALLer of __flash_x)
+    //       ...
+    //   __flash_x_e:
+    //
+    // MOVWF PCL writes all 13 PC bits (PCLATH<4:0> : W), so entries may cross
+    // 256-word and even 2K-page boundaries. The only page-sensitive step is the
+    // CALL itself (PC<12:11> come from PCLATH<4:3>, which we loaded with the
+    // entry address): asserted at assembly time below.
+
+    private void CompileVariant(FlashData arg)
+    {
+        // Data definition: registered here, emitted at the end by EmitFlashTables.
+        if (!_flashDataNames.Add(arg.Name)) return; // interned duplicates
+        if (arg.Bytes.Count > 256)
+            throw new NotSupportedException(
+                $"PIC14: flash table '{arg.Name}' has {arg.Bytes.Count} bytes; " +
+                "runtime table indexes are 8-bit, so tables are capped at 256 bytes");
+        _flashData.Add((arg.Name, arg.Bytes));
+    }
+
+    private void CompileVariant(ArrayLoadFlash arg)
+    {
+        // Dst = flash_table[Index]. PCLATH is a core register (mirrored in every
+        // bank), so no bank selects are needed around it.
+        string tbl = FlashLabel(arg.ArrayName);
+        Emit("MOVLW", $"HIGH({tbl}_t)");
+        Emit("MOVWF", "PCLATH");
+        LoadIntoW(arg.Index); // 8-bit index (tables are capped at 256 entries)
+        Emit("CALL", tbl);
+        // The rest of the backend assumes page 0 (PCLATH untouched elsewhere):
+        // restore it so later GOTO/CALL pages stay correct.
+        Emit("CLRF", "PCLATH");
+        StoreWInto(arg.Dst);
+    }
+
+    private void CompileVariant(FlashLoadPtr arg)
+    {
+        // Dst = flash[Ptr + Index], where Ptr is a RUNTIME 16-bit flash word
+        // address (a const[str] passed by reference, e.g. uart_write_str's
+        // parameter). The entry address is computed into PCLATH:W and reached
+        // through the shared __flash_jmp trampoline (MOVWF PCL); the RETLW at
+        // the entry returns to OUR caller frame (the CALL below).
+        if (arg.Ptr is FlashStrAddr fsa)
+        {
+            // Degenerate case: the pointer is a compile-time label after all.
+            CompileVariant(new ArrayLoadFlash(fsa.Name, arg.Index, arg.Dst));
+            return;
+        }
+
+        _needsFlashJmp = true;
+        string lo = ResolveAddress(arg.Ptr);
+        string hi = HighByteOperand(lo);
+        SelectBank(hi);
+        Emit("MOVF", hi, "W");
+        Emit("MOVWF", "PCLATH");
+        LoadIntoW(arg.Index); // 8-bit index (flash strings are < 256 bytes)
+        SelectBank(lo);
+        Emit("ADDWF", lo, "W");       // W = lo(ptr) + index
+        Emit("BTFSC", "STATUS", "0");
+        Emit("INCF", "PCLATH", "F");  // carry into the high byte
+        Emit("CALL", "__flash_jmp");
+        Emit("CLRF", "PCLATH");
+        StoreWInto(arg.Dst);
+    }
+
+    private void EmitFlashTables()
+    {
+        if (_flashData.Count == 0)
+        {
+            if (_needsFlashJmp)
+                throw new InvalidOperationException(
+                    "PIC14: FlashLoadPtr was emitted but no FlashData table exists");
+            return;
+        }
+
+        EmitComment("--- Flash tables (RETLW lists, computed GOTO; see PIC14CodeGen) ---");
+        if (_needsFlashJmp)
+        {
+            EmitComment("Shared trampoline: full entry address in PCLATH<4:0>:W.");
+            EmitLabel("__flash_jmp");
+            Emit("MOVWF", "PCL");
+        }
+
+        foreach (var (name, bytes) in _flashData)
+        {
+            string tbl = FlashLabel(name);
+            EmitLabel(tbl);
+            Emit("ADDLW", $"LOW({tbl}_t)");
+            Emit("BTFSC", "STATUS", "0");
+            Emit("INCF", "PCLATH", "F");
+            Emit("MOVWF", "PCL");
+            EmitLabel($"{tbl}_t");
+            // Raw lines: the peephole never touches Raw, so the RETLW list and
+            // the table layout survive every optimization pass untouched.
+            foreach (int b in bytes)
+                EmitRaw($"\tRETLW 0x{b & 0xFF:X2}");
+            EmitLabel($"{tbl}_e");
+
+            // Assembly-time guards for the page-sensitive steps. gpasm resolves
+            // both labels by now (absolute mode, ORG 0).
+            // 1. CALL <tbl> executes with PCLATH = HIGH(<tbl>_t): PC<12:11> come
+            //    from PCLATH<4:3>, so the prologue must share the entries' page.
+            EmitRaw($"\tIF (({tbl} >> 11) != (({tbl}_t) >> 11))");
+            EmitRaw($"\tERROR \"{tbl}: prologue and entries straddle a 2K page boundary\"");
+            EmitRaw("\tENDIF");
+            if (_needsFlashJmp)
+            {
+                // 2. CALL __flash_jmp executes with PCLATH = HIGH(entry): every
+                //    entry must live in the trampoline's 2K page.
+                EmitRaw($"\tIF ((__flash_jmp >> 11) != (({tbl}_t) >> 11)) || ((__flash_jmp >> 11) != (({tbl}_e - 1) >> 11))");
+                EmitRaw($"\tERROR \"{tbl}: entries and __flash_jmp straddle a 2K page boundary\"");
+                EmitRaw("\tENDIF");
+            }
+        }
+
+        EmitRaw("");
+    }
+
     // --- Logic Helpers ---
 
     private void LoadIntoW(Val val)
@@ -1132,6 +1287,11 @@ public class PIC14CodeGen : CodeGen
             Emit("MOVLW", "0x00");
             return;
         }
+
+        if (val is FlashStrAddr)
+            throw new NotSupportedException(
+                "PIC14: a flash string address is 16-bit and cannot be loaded " +
+                "into W; it must flow through a 16-bit Copy (function argument)");
 
         if (val is Constant c)
         {
@@ -1189,7 +1349,19 @@ public class PIC14CodeGen : CodeGen
                 ? $"0x{ParseHexAddr(dstLo) + 1:X2}"
                 : dstLo + "+1";
 
-            if (arg.Src is Constant sc)
+            if (arg.Src is FlashStrAddr fsa)
+            {
+                // 16-bit flash word address of the string's RETLW entries
+                // (consumed byte-by-byte via FlashLoadPtr in the callee).
+                string entries = FlashLabel(fsa.Name) + "_t";
+                Emit("MOVLW", $"LOW({entries})");
+                SelectBank(dstLo);
+                Emit("MOVWF", dstLo);
+                Emit("MOVLW", $"HIGH({entries})");
+                SelectBank(dstHi);
+                Emit("MOVWF", dstHi);
+            }
+            else if (arg.Src is Constant sc)
             {
                 int val = sc.Value;
                 Emit("MOVLW", $"0x{val & 0xFF:X2}");
@@ -1347,6 +1519,7 @@ public class PIC14CodeGen : CodeGen
         if (val is Temporary t && _varSizes.ContainsKey(t.Name)) return _varSizes[t.Name];
         if (val is MemoryAddress m && m.Type == DataType.UINT16) return 2;
         if (val is Constant c && (c.Value > 255 || c.Value < 0)) return 2;
+        if (val is FlashStrAddr) return 2; // 16-bit flash word address
         return 1;
     }
 
@@ -2004,6 +2177,23 @@ public class PIC14CodeGen : CodeGen
 
     private void CompileVariant(Call arg)
     {
+        // Copy arguments into the callee's parameter stack slots ("callee.param").
+        // The compiled stack is static (no recursion), so parameter passing is a
+        // plain Copy; sizes resolve through the allocator's tables (a const[str]
+        // argument is a 16-bit FlashStrAddr into a 16-bit flash-pointer slot).
+        if (arg.Args is { Count: > 0 })
+        {
+            if (!_funcByName.TryGetValue(arg.FunctionName, out var callee))
+                throw new InvalidOperationException(
+                    $"PIC14: call to unknown function '{arg.FunctionName}' with arguments");
+            if (arg.Args.Count > callee.Params.Count)
+                throw new InvalidOperationException(
+                    $"PIC14: call to '{arg.FunctionName}' passes {arg.Args.Count} " +
+                    $"arguments but it declares {callee.Params.Count} parameters");
+            for (int i = 0; i < arg.Args.Count; i++)
+                CompileVariant(new Copy(arg.Args[i], new Variable(callee.Params[i])));
+        }
+
         Emit("CALL", arg.FunctionName);
         // Called function may change BSR; invalidate both tracking
         _currentBank = -1;
