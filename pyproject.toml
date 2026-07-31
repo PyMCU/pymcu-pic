@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pymcu-pic"
-version = "0.1.0a1"
+version = "0.1.0a3"
 description = "PIC support for pymcu-compiler: codegen backend (PIC12/PIC14/PIC18) + gputils toolchain driver"
 readme = "README.md"
 authors = [
@@ -13,7 +13,7 @@ authors = [
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "pymcu-sdk>=0.1.0a1",
+    "pymcu-sdk>=0.1.0a3",
 ]
 
 [project.entry-points."pymcu.toolchains"]
