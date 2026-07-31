@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Builds the backend library and runs the unit suite. The integration suite
+  # needs the PicSharp emulator (not yet published) and runs locally only.
+  unit-tests:
+    name: Build + unit tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # Both repos checked out as siblings so the relative csproj paths
+      # (../../../../PyMCU/extensions/... and ../../../PyMCU/src/compiler/...)
+      # resolve correctly from inside pymcu-pic/.
+      - name: Checkout pymcu-pic
+        uses: actions/checkout@v4
+        with:
+          path: pymcu-pic
+
+      - name: Checkout pymcu monorepo (SDK + compiler dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: PyMCU/PyMCU
+          ref: main
+          path: PyMCU
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: PyMCU/global.json
+
+      - name: Run unit tests
+        working-directory: pymcu-pic
+        run: dotnet test tests/unit --nologo
