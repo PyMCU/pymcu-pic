@@ -1,8 +1,18 @@
 # pymcu-pic
 
-PIC support for [PyMCU](https://github.com/PyMCU/pymcu): codegen backend
+PIC support for [PyMCU](https://github.com/PyMCU/PyMCU): codegen backend
 (PIC12 baseline, PIC14/16F mid-range, PIC18F) plus the gputils toolchain
 driver (gpasm/gplink), in a single package.
+
+## Install (users)
+
+```bash
+pip install --pre "pymcu-compiler[pic]"
+```
+
+The `[pic]` extra pulls this backend plus
+[pymcu-pic-toolchain](https://github.com/PyMCU/pymcu-pic-toolchain) (pre-built
+`gpasm` + device headers) — no system gputils needed.
 
 ## Layout
 
@@ -21,10 +31,11 @@ examples/blink/    Reference example: LED on RB0, PIC16F877A @ 20 MHz
 - .NET 10 SDK
 - The `PyMCU` monorepo checked out as a sibling directory (`../PyMCU`) —
   the C# projects reference `pymcu-sdk` by relative path.
-- [PicSharp](https://github.com/begeistert/PicSharp) checked out as a sibling
-  (`../PicSharp`) for the integration tests.
-- gputils (`brew install gputils` / `apt install gputils`) for assembling
-  (auto-downloaded and compiled on first use otherwise).
+- PicSharp (not yet published) checked out as a sibling (`../PicSharp`) for
+  the integration tests.
+- An assembler: the [pymcu-pic-toolchain](https://github.com/PyMCU/pymcu-pic-toolchain)
+  wheel (installed automatically with `pymcu-compiler[pic]`), or a system
+  gputils (`brew install gputils` / `apt install gputils`).
 
 ## Build
 
