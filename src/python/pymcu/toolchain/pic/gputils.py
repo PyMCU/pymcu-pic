@@ -125,8 +125,35 @@ class GputilsToolchain(ExternalToolchain):
         found = _shutil.which("gpasm")
         return Path(found) if found else None
 
+    @staticmethod
+    def _find_wheel_gpasm() -> "Path | None":
+        """
+        Return gpasm from the pymcu-pic-toolchain wheel if installed.
+
+        The wheel (see PyMCU/pymcu-pic-toolchain) bundles gpasm plus the
+        gputils device headers, making `pip install pymcu-compiler[pic]`
+        self-contained -- same pattern as pymcu-avr-toolchain and
+        pymcu-arm-toolchain.
+        """
+        try:
+            import pymcu_pic_toolchain as _whl  # noqa: PLC0415
+            return Path(_whl.get_tool("gpasm"))
+        except (ImportError, FileNotFoundError):
+            return None
+
+    @staticmethod
+    def _wheel_header_dir() -> "Path | None":
+        """The bundled gputils header directory from the wheel, or None."""
+        try:
+            import pymcu_pic_toolchain as _whl  # noqa: PLC0415
+            return _whl.header_dir()
+        except ImportError:
+            return None
+
     def is_cached(self) -> bool:
-        # System PATH takes priority
+        # Bundled wheel binary, then system PATH, take priority
+        if self._find_wheel_gpasm() is not None:
+            return True
         if self._find_system_gpasm() is not None:
             return True
         try:
@@ -138,6 +165,9 @@ class GputilsToolchain(ExternalToolchain):
             return False
 
     def _resolve_binary(self) -> Path:
+        wheel_path = self._find_wheel_gpasm()
+        if wheel_path:
+            return wheel_path
         sys_path = self._find_system_gpasm()
         if sys_path:
             return sys_path
@@ -149,12 +179,22 @@ class GputilsToolchain(ExternalToolchain):
         except RuntimeError:
             pass
         raise RuntimeError(
-            "gpasm not found on PATH or in local cache.\n"
-            "Install it with:  brew install gputils  or  sudo apt install gputils\n"
+            "gpasm not found: the pymcu-pic-toolchain wheel is not installed "
+            "and gpasm is not on PATH or in the local cache.\n"
+            "Install it with:  pip install pymcu-pic-toolchain\n"
+            "or:  brew install gputils  /  sudo apt install gputils\n"
             "or run 'pymcu toolchain install pic' to download it automatically."
         )
 
     def install(self) -> Path:
+        # Bundled wheel binary: nothing to do.
+        wheel_bin = self._find_wheel_gpasm()
+        if wheel_bin:
+            self.console.print(
+                f"[green]gpasm bundled by pymcu-pic-toolchain at {wheel_bin}[/green]"
+            )
+            self._write_cached_version(self.METADATA["version"])
+            return wheel_bin
         # If already on system PATH, nothing to do.
         sys_bin = self._find_system_gpasm()
         if sys_bin:
@@ -269,9 +309,13 @@ class GputilsToolchain(ExternalToolchain):
         # Include directory of the source file (so float.inc next to it is found)
         cmd.extend(["-I", str(asm_file.parent.resolve())])
         
-        # Header Include Fix: cached binary layout
-        # Structure: .../gputils-1.5.2/gpasm/gpasm -> header is at .../gputils-1.5.2/header
-        if not self._find_system_gpasm():
+        # Device headers (*.inc): the wheel bundles them next to its gpasm;
+        # a from-source cache build keeps them in the source tree layout
+        # (.../gputils-1.5.2/gpasm/gpasm -> header at .../gputils-1.5.2/header).
+        wheel_headers = self._wheel_header_dir()
+        if wheel_headers is not None:
+            cmd.extend(["-I", str(wheel_headers)])
+        elif not self._find_system_gpasm():
             try:
                 info = self._get_platform_info()
                 local_bin = self._get_tool_dir() / info["bin_path"]
