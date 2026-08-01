@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pymcu-pic"
-version = "0.1.0a3"
+version = "0.1.0a3.post0"
 description = "PIC support for pymcu-compiler: codegen backend (PIC12/PIC14/PIC18) + gputils toolchain driver"
 readme = "README.md"
 authors = [
@@ -14,6 +14,10 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
     "pymcu-sdk>=0.1.0a3",
+    # Pull in the pre-built gputils (gpasm + device headers) wheel so that
+    # `pip install pymcu-compiler[pic]` is self-contained. Wheels cover the
+    # platforms below; elsewhere the driver falls back to a system gputils.
+    "pymcu-pic-toolchain>=1.5.2; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'linux' and platform_machine == 'aarch64') or (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'darwin' and platform_machine == 'x86_64')",
 ]
 
 [project.entry-points."pymcu.toolchains"]
