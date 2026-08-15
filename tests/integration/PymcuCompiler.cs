@@ -60,9 +60,16 @@ public static class PymcuCompiler
     /// <param name="mainPy">The program source.</param>
     /// <param name="target">Target chip (default: the CI reference PIC16F877A).</param>
     /// <param name="frequencyHz">Oscillator frequency in Hz (default: 20 MHz).</param>
-    public static string BuildSource(string mainPy, string target = "pic16f877a", int frequencyHz = 20_000_000)
-        => Cache.GetOrAdd($"src:{target}:{frequencyHz}:{Sha(mainPy)}",
-            _ => new Lazy<string>(() => CompileSource(mainPy, target, frequencyHz))).Value;
+    /// <param name="extraSources">
+    /// Additional files to drop into the project's source tree, keyed by path
+    /// relative to <c>src/</c>. The compiler resolves <c>pymcu.chips.*</c> imports
+    /// from the project sources before the installed stdlib, so a test can ship its
+    /// own <c>pymcu/chips/&lt;chip&gt;.py</c> for a part the stdlib does not carry.
+    /// </param>
+    public static string BuildSource(string mainPy, string target = "pic16f877a", int frequencyHz = 20_000_000,
+        IReadOnlyDictionary<string, string>? extraSources = null)
+        => Cache.GetOrAdd($"src:{target}:{frequencyHz}:{Sha(mainPy)}:{Sha(Flatten(extraSources))}",
+            _ => new Lazy<string>(() => CompileSource(mainPy, target, frequencyHz, extraSources))).Value;
 
     private static string Sha(string s)
     {
@@ -70,9 +77,16 @@ public static class PymcuCompiler
         return Convert.ToHexString(bytes);
     }
 
-    private static string CompileSource(string mainPy, string target, int frequencyHz)
+    private static string Flatten(IReadOnlyDictionary<string, string>? sources)
+        => sources is null
+            ? ""
+            : string.Join("\0", sources.OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                                       .Select(kv => kv.Key + "\0" + kv.Value));
+
+    private static string CompileSource(string mainPy, string target, int frequencyHz,
+        IReadOnlyDictionary<string, string>? extraSources)
     {
-        var key = Sha($"{target}:{frequencyHz}:{mainPy}");
+        var key = Sha($"{target}:{frequencyHz}:{mainPy}:{Flatten(extraSources)}");
         var dir = Path.Combine(Path.GetTempPath(), "pymcu-gen", key[..16]);
         Directory.CreateDirectory(Path.Combine(dir, "src"));
         File.WriteAllText(Path.Combine(dir, "pyproject.toml"),
@@ -87,6 +101,16 @@ public static class PymcuCompiler
             "sources = \"src\"\n" +
             "entry = \"main.py\"\n");
         File.WriteAllText(Path.Combine(dir, "src", "main.py"), mainPy);
+        if (extraSources is not null)
+        {
+            foreach (var (relative, content) in extraSources)
+            {
+                var path = Path.Combine(dir, "src", relative);
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.WriteAllText(path, content);
+            }
+        }
+
         return Compile(dir, "gen-" + key[..8]);
     }
 
