@@ -94,6 +94,51 @@ public abstract class ArchStrategy
     public abstract void EmitContextSave();
     public abstract void EmitContextRestore();
     public abstract void EmitInterruptReturn();
+
+    // --- Indirect addressing -------------------------------------------------
+    //
+    // The two PIC14 cores expose very different hardware here:
+    //
+    //   legacy   one 8-bit FSR (0x04) whose 9th address bit is STATUS<IRP>,
+    //            read/written through INDF (0x00); the pointer is advanced with
+    //            INCF FSR, F.
+    //   enhanced two 16-bit index registers FSR0/FSR1 (FSR0L 0x04 / FSR0H 0x05)
+    //            read/written through INDF0 (0x00) / INDF1; no IRP bit at all,
+    //            plus MOVIW/MOVWI (pre/post increment and decrement) and ADDFSR.
+    //
+    // Emitting the legacy mnemonics on a PIC16F1xxxx does not just run wrong, it
+    // does not even assemble: "FSR" and "INDF" are not defined in its header.
+    // Every indirect access therefore goes through the operations below so the
+    // generator itself stays core-agnostic. The backend only ever uses one index
+    // register (FSR0 on the enhanced core), matching the single FSR of the legacy
+    // one; FSR1 is left free for future use (e.g. memcpy-style loops).
+
+    /// <summary>Points the index register at the RAM address held in W.</summary>
+    /// <param name="clearHigh">
+    /// Ask for the high half of the pointer to be forced to zero, i.e. the target
+    /// is known to live below 0x100. The enhanced core always writes the high half
+    /// regardless: FSR0H is a real register with no implicit value, so leaving a
+    /// stale one behind would aim the pointer at an arbitrary bank.
+    /// </param>
+    public abstract void EmitPointerFromW(bool clearHigh);
+
+    /// <summary>Points the index register at a compile-time RAM address.</summary>
+    public abstract void EmitPointerFromConst(int address);
+
+    /// <summary>W = *pointer.</summary>
+    public abstract void EmitIndirectLoadW();
+
+    /// <summary>*pointer = W.</summary>
+    public abstract void EmitIndirectStoreW();
+
+    /// <summary>*pointer = 0.</summary>
+    public abstract void EmitIndirectClear();
+
+    /// <summary>*pointer = W, then advance the pointer one byte.</summary>
+    public abstract void EmitIndirectStoreWAndAdvance();
+
+    /// <summary>Advance the pointer one byte, then W = *pointer.</summary>
+    public abstract void EmitAdvanceAndIndirectLoadW();
 }
 
 // Legacy PIC14 Architecture (e.g. PIC16F84A, PIC16F877A)
@@ -150,6 +195,45 @@ public class PIC14Strategy : ArchStrategy
     }
 
     public override void EmitInterruptReturn() => _codegen.Emit("RETFIE");
+
+    // --- Indirect addressing: FSR / INDF + STATUS<IRP> ---
+    //
+    // IRP is only cleared where the generator historically cleared it (the array
+    // paths, whose storage is known to sit below 0x100). The pointer paths leave
+    // it alone, so a ptr() dereference inherits whatever IRP the last array access
+    // left behind — harmless today because every allocation lives in bank 0, but a
+    // latent bug the moment the allocator can place data above 0xFF.
+
+    public override void EmitPointerFromW(bool clearHigh)
+    {
+        _codegen.Emit("MOVWF", "FSR");
+        if (clearHigh)
+            _codegen.Emit("BCF", "STATUS", "7"); // IRP = 0
+    }
+
+    public override void EmitPointerFromConst(int address)
+    {
+        _codegen.Emit("MOVLW", $"0x{address & 0xFF:X2}");
+        _codegen.Emit("MOVWF", "FSR");
+    }
+
+    public override void EmitIndirectLoadW() => _codegen.Emit("MOVF", "INDF", "W");
+
+    public override void EmitIndirectStoreW() => _codegen.Emit("MOVWF", "INDF");
+
+    public override void EmitIndirectClear() => _codegen.Emit("CLRF", "INDF");
+
+    public override void EmitIndirectStoreWAndAdvance()
+    {
+        _codegen.Emit("MOVWF", "INDF");
+        _codegen.Emit("INCF", "FSR", "F");
+    }
+
+    public override void EmitAdvanceAndIndirectLoadW()
+    {
+        _codegen.Emit("INCF", "FSR", "F");
+        _codegen.Emit("MOVF", "INDF", "W");
+    }
 }
 
 // Enhanced PIC14E Architecture (e.g. PIC16F1xxxx)
@@ -200,6 +284,71 @@ public class PIC14EStrategy : ArchStrategy
     }
 
     public override void EmitInterruptReturn() => _codegen.Emit("RETFIE");
+
+    // --- Indirect addressing: FSR0 / INDF0 -----------------------------------
+    //
+    // Why the traditional (banked) view and not the linear data memory at 0x2000
+    // ------------------------------------------------------------------------
+    // FSR0 is a 16-bit pointer with two views of RAM: 0x0000-0x0FFF is the
+    // traditional map (the same flat file address the direct-addressing EQUs
+    // use), and 0x2000-0x29AF is the linear map, which stitches the per-bank GPR
+    // windows into one gap-free run.
+    //
+    // The generator addresses arrays as "MOVLW index / ADDLW <array>" — 8-bit
+    // arithmetic on the array's flat file address — so an array is by
+    // construction reachable below 0x100 and never straddles a bank boundary.
+    // Under that layout the traditional view is an exact match: the address
+    // already in W is the address FSR0 wants, and pointing at it costs one MOVWF
+    // plus one CLRF. Switching to the linear map would mean rebasing every access
+    // (linear = 0x2000 + file - 0x20 only holds inside bank 0) for no gain.
+    //
+    // The linear map earns its keep the day the stack allocator can spread data
+    // past bank 0's GPR window (0x20-0x6F on these parts): a >80-byte array only
+    // becomes contiguous — and index arithmetic only stays a plain add — in the
+    // linear view. That is an allocator change, not a codegen one, so it is
+    // deliberately not anticipated here.
+
+    public override void EmitPointerFromW(bool clearHigh)
+    {
+        // clearHigh is ignored on purpose: unlike STATUS<IRP>, FSR0H has no
+        // "default" state to fall back on, so it must always be written.
+        _codegen.Emit("MOVWF", "FSR0L");
+        _codegen.Emit("CLRF", "FSR0H");
+    }
+
+    public override void EmitPointerFromConst(int address)
+    {
+        _codegen.Emit("MOVLW", $"0x{address & 0xFF:X2}");
+        _codegen.Emit("MOVWF", "FSR0L");
+
+        // 16-bit pointer: unlike the legacy core, an address above 0xFF is
+        // reachable, so the high byte is kept instead of being truncated away.
+        int high = (address >> 8) & 0xFF;
+        if (high == 0)
+        {
+            _codegen.Emit("CLRF", "FSR0H");
+        }
+        else
+        {
+            _codegen.Emit("MOVLW", $"0x{high:X2}");
+            _codegen.Emit("MOVWF", "FSR0H");
+        }
+    }
+
+    public override void EmitIndirectLoadW() => _codegen.Emit("MOVF", "INDF0", "W");
+
+    public override void EmitIndirectStoreW() => _codegen.Emit("MOVWF", "INDF0");
+
+    public override void EmitIndirectClear() => _codegen.Emit("CLRF", "INDF0");
+
+    // The two fused forms below are exactly what MOVWI/MOVIW were added for: the
+    // store/load and the pointer bump collapse into a single instruction. Where
+    // the bump stands on its own the generator does not need it, so ADDFSR (which
+    // also leaves Z alone, unlike the legacy INCF) never has to appear.
+
+    public override void EmitIndirectStoreWAndAdvance() => _codegen.Emit("MOVWI", "FSR0++");
+
+    public override void EmitAdvanceAndIndirectLoadW() => _codegen.Emit("MOVIW", "++FSR0");
 }
 
 // ---------------------------------------------------------------------------

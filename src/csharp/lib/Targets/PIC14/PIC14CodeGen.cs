@@ -982,9 +982,10 @@ public class PIC14CodeGen : CodeGen
                 $"'{arrayName}' of length {count}");
     }
 
-    // Leaves FSR pointing at &array[index] (scaled by element size). All PIC14
-    // arrays live in bank 0 (< 0x100), so IRP is force-cleared.
-    private void EmitArrayElementFsr(string arrayName, Val index, int elemSize)
+    // Leaves the index register pointing at &array[index] (scaled by element
+    // size). The address is computed with 8-bit arithmetic (ADDLW), so every
+    // array lives below 0x100 and the pointer's high half is force-cleared.
+    private void EmitArrayElementPointer(string arrayName, Val index, int elemSize)
     {
         string baseOp = ArrayBaseOperand(arrayName);
         if (elemSize == 2)
@@ -1001,8 +1002,7 @@ public class PIC14CodeGen : CodeGen
         }
 
         Emit("ADDLW", baseOp);            // W = &array[0] + scaled index
-        Emit("MOVWF", "FSR");
-        Emit("BCF", "STATUS", "7");       // IRP = 0
+        _strategy.EmitPointerFromW(clearHigh: true);
     }
 
     private void CompileVariant(ArrayLoad arg)
@@ -1043,16 +1043,15 @@ public class PIC14CodeGen : CodeGen
             return;
         }
 
-        EmitArrayElementFsr(arg.ArrayName, arg.Index, elemSize);
-        Emit("MOVF", "INDF", "W");
+        EmitArrayElementPointer(arg.ArrayName, arg.Index, elemSize);
+        _strategy.EmitIndirectLoadW();
         StoreWInto(arg.Dst);
         if (dstSize == 2)
         {
             string dstHi = HighByteOperand(ResolveAddress(arg.Dst));
             if (elemSize == 2)
             {
-                Emit("INCF", "FSR", "F");
-                Emit("MOVF", "INDF", "W");
+                _strategy.EmitAdvanceAndIndirectLoadW();
                 SelectBank(dstHi);
                 Emit("MOVWF", dstHi);
             }
@@ -1117,36 +1116,38 @@ public class PIC14CodeGen : CodeGen
             return;
         }
 
-        EmitArrayElementFsr(arg.ArrayName, arg.Index, elemSize);
+        EmitArrayElementPointer(arg.ArrayName, arg.Index, elemSize);
         LoadIntoW(arg.Src);
-        Emit("MOVWF", "INDF");
-        if (elemSize == 2)
+        if (elemSize != 2)
         {
-            Emit("INCF", "FSR", "F");
-            if (arg.Src is Constant sc2)
+            _strategy.EmitIndirectStoreW();
+            return;
+        }
+
+        _strategy.EmitIndirectStoreWAndAdvance();
+        if (arg.Src is Constant sc2)
+        {
+            int hv = (sc2.Value >> 8) & 0xFF;
+            if (hv == 0)
             {
-                int hv = (sc2.Value >> 8) & 0xFF;
-                if (hv == 0)
-                {
-                    Emit("CLRF", "INDF");
-                }
-                else
-                {
-                    Emit("MOVLW", $"0x{hv:X2}");
-                    Emit("MOVWF", "INDF");
-                }
-            }
-            else if (GetValSize(arg.Src) >= 2)
-            {
-                string srcHi = HighByteOperand(ResolveAddress(arg.Src));
-                SelectBank(srcHi);
-                Emit("MOVF", srcHi, "W");
-                Emit("MOVWF", "INDF");
+                _strategy.EmitIndirectClear();
             }
             else
             {
-                Emit("CLRF", "INDF");
+                Emit("MOVLW", $"0x{hv:X2}");
+                _strategy.EmitIndirectStoreW();
             }
+        }
+        else if (GetValSize(arg.Src) >= 2)
+        {
+            string srcHi = HighByteOperand(ResolveAddress(arg.Src));
+            SelectBank(srcHi);
+            Emit("MOVF", srcHi, "W");
+            _strategy.EmitIndirectStoreW();
+        }
+        else
+        {
+            _strategy.EmitIndirectClear();
         }
     }
 
@@ -1453,21 +1454,19 @@ public class PIC14CodeGen : CodeGen
 
     private void CompileVariant(LoadIndirect arg)
     {
-        // PIC14 Indirect Addressing: FSR / INDF
         if (arg.SrcPtr is Constant cp)
         {
-            Emit("MOVLW", $"0x{cp.Value & 0xFF:X2}");
-            Emit("MOVWF", "FSR");
+            _strategy.EmitPointerFromConst(cp.Value);
         }
         else
         {
             string ptrAddr = ResolveAddress(arg.SrcPtr);
             SelectBank(ptrAddr);
             Emit("MOVF", ptrAddr, "W");
-            Emit("MOVWF", "FSR");
+            _strategy.EmitPointerFromW(clearHigh: false);
         }
 
-        Emit("MOVF", "INDF", "W");
+        _strategy.EmitIndirectLoadW();
         StoreWInto(arg.Dst);
     }
 
@@ -1475,19 +1474,18 @@ public class PIC14CodeGen : CodeGen
     {
         if (arg.DstPtr is Constant cp)
         {
-            Emit("MOVLW", $"0x{cp.Value & 0xFF:X2}");
-            Emit("MOVWF", "FSR");
+            _strategy.EmitPointerFromConst(cp.Value);
         }
         else
         {
             string ptrAddr = ResolveAddress(arg.DstPtr);
             SelectBank(ptrAddr);
             Emit("MOVF", ptrAddr, "W");
-            Emit("MOVWF", "FSR");
+            _strategy.EmitPointerFromW(clearHigh: false);
         }
 
         LoadIntoW(arg.Src);
-        Emit("MOVWF", "INDF");
+        _strategy.EmitIndirectStoreW();
     }
 
     private void CompileVariant(Unary arg)
