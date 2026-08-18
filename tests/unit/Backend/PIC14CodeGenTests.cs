@@ -63,6 +63,31 @@ public class PIC14CodeGenTests
         Assert.DoesNotContain("__CONFIG", asm);
     }
 
+    [Fact]
+    public void UnhandledExceptionBranch_ParksAtTheTrap_NotAtAnUndefinedSymbol()
+    {
+        var prog = MakeProgram("main",
+            new Call("helper", new List<Val>(), new NoneVal()),
+            new BranchOnError("__pymcu_unhandled_exn"),
+            new Return(new NoneVal()));
+        var asm = Compile(prog);
+
+        Assert.DoesNotContain("GOTO\t__pymcu_unhandled_exn", asm);
+        Assert.Contains("GOTO\t__err_trap", asm);
+        Assert.Contains("__err_trap", asm);
+    }
+
+    [Fact]
+    public void TryExceptTrampoline_IsStillRejectedOnPic14()
+    {
+        var prog = MakeProgram("main",
+            new Call("__pymcu_unhandled_exn", new List<Val>(), new NoneVal()),
+            new Return(new NoneVal()));
+
+        var ex = Assert.Throws<NotSupportedException>(() => Compile(prog));
+        Assert.Contains("runtime exceptions", ex.Message);
+    }
+
     private static ProgramIR MakeProgram(string name, params Instruction[] body)
     {
         var prog = new ProgramIR();

@@ -223,6 +223,7 @@ public class PIC18CodeGen : CodeGen
         private const string MulStage = "__mul_b";
         private const string ErrCell = "__err";
         private const string ErrTrapLabel = "__err_trap";
+        private const string UnhandledExnLabel = "__pymcu_unhandled_exn";
 
         private bool needsErrTrap;
 
@@ -592,8 +593,7 @@ public class PIC18CodeGen : CodeGen
         {
             foreach (var func in program.Functions)
             foreach (var instr in func.Body)
-                if (instr is Call { FunctionName: "__pymcu_unhandled_exn" }
-                    or BranchOnError { ErrorLabel: "__pymcu_unhandled_exn" })
+                if (instr is Call { FunctionName: UnhandledExnLabel })
                     throw new NotSupportedException(
                         "PIC18CodeGen: runtime exceptions (try/except, and a raise that survives to " +
                     "run time) are not implemented yet for the PIC18 " +
@@ -1818,7 +1818,14 @@ public class PIC18CodeGen : CodeGen
         {
             string err = AllocAccessScratch(ErrCell);
             Emit("MOVF", err, "F", GetAccessMode(err));
-            Emit("BNZ", arg.ErrorLabel);
+            string target = arg.ErrorLabel;
+            if (target == UnhandledExnLabel)
+            {
+                needsErrTrap = true;
+                target = ErrTrapLabel;
+            }
+
+            Emit("BNZ", target);
         }
 
         private void EmitErrorTrap()

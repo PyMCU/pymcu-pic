@@ -361,8 +361,7 @@ public class PIC14CodeGen : CodeGen
     {
         foreach (var func in program.Functions)
         foreach (var instr in func.Body)
-            if (instr is Call { FunctionName: "__pymcu_unhandled_exn" }
-                or BranchOnError { ErrorLabel: "__pymcu_unhandled_exn" })
+            if (instr is Call { FunctionName: "__pymcu_unhandled_exn" })
                 throw new NotSupportedException(
                     "PIC14CodeGen: runtime exceptions (try/except, and a raise that survives to " +
                     "run time) are not implemented yet for the PIC14 " +
@@ -1037,7 +1036,14 @@ public class PIC14CodeGen : CodeGen
         SelectBank(err);
         Emit("MOVF", err, "F");       // Z = (__err == 0)
         Emit("BTFSS", "STATUS", "2"); // Z set (no error) -> skip the branch
-        Emit("GOTO", arg.ErrorLabel);
+        string target = arg.ErrorLabel;
+        if (target == "__pymcu_unhandled_exn")
+        {
+            _needsErrTrap = true;
+            target = "__err_trap";
+        }
+
+        Emit("GOTO", target);
     }
 
     // --- Arrays (RAM, direct or FSR/INDF) -------------------------------------

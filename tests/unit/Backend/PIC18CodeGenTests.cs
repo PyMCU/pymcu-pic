@@ -452,15 +452,27 @@ public class PIC18CodeGenTests
     // ─── Exceptions ───────────────────────────────────────────────────────────
 
     [Fact]
-    public void UnhandledExceptionBranch_IsRejectedToo_NotOnlyTheCall()
+    public void UnhandledExceptionBranch_ParksAtTheTrap_NotAtAnUndefinedSymbol()
     {
         var prog = MakeProgram("main",
             new Call("helper", new List<Val>(), new NoneVal()),
             new BranchOnError("__pymcu_unhandled_exn"),
             new Return(new NoneVal()));
+        var asm = Compile(prog);
+
+        Assert.DoesNotContain("BNZ\t__pymcu_unhandled_exn", asm);
+        Assert.Contains("BNZ\t__err_trap", asm);
+        Assert.Contains("__err_trap:", asm);
+    }
+
+    [Fact]
+    public void TryExceptTrampoline_IsStillRejected()
+    {
+        var prog = MakeProgram("main",
+            new Call("__pymcu_unhandled_exn", new List<Val>(), new NoneVal()),
+            new Return(new NoneVal()));
 
         var ex = Assert.Throws<NotSupportedException>(() => Compile(prog));
-        Assert.Contains("__pymcu_unhandled_exn", ex.Message);
         Assert.Contains("runtime exceptions", ex.Message);
     }
 
