@@ -737,13 +737,43 @@ public class PIC18CodeGenTests
     }
 
     [Fact]
-    public void WideMul_BeyondSixteenBits_IsRejectedInsteadOfTruncating()
+    public void WideMul_IntoThirtyTwoBits_AccumulatesEveryPartialProduct()
     {
         var prog = MakeProgram("main",
             new Binary(BinaryOp.Mul, U32("a"), U32("b"), U32("d")));
+        var asm = Compile(prog);
 
-        var ex = Assert.Throws<NotSupportedException>(() => Compile(prog));
-        Assert.Contains("wider than 16 bits", ex.Message);
+        // 32x32 truncated to 32 keeps the products with i+j < 4: 4+3+2+1 = 10
+        Assert.Equal(10, asm.Split('\n').Count(l => l.Contains("MULWF")));
+        Assert.Contains("CLRF\t__mul_r+3", asm);
+        Assert.Contains("ADDWFC\t__mul_r+3", asm);
+        Assert.Contains("MOVWF\td+3", asm);
+    }
+
+    [Fact]
+    public void WideMul_SkipsPartialProductsWhoseByteIsStaticallyZero()
+    {
+        var prog = MakeProgram("main",
+            new Binary(BinaryOp.Mul, U16("a"), new Constant(3), U32("d")));
+        var asm = Compile(prog);
+
+        // a is 2 bytes and 3 fits in one: only a[0]*3 and a[1]*3 can be non-zero
+        Assert.Equal(2, asm.Split('\n').Count(l => l.Contains("MULWF")));
+        Assert.Contains("MOVWF\td+3", asm);
+    }
+
+    [Fact]
+    public void WideMul_CarriesAcrossTheSixteenBitBoundary()
+    {
+        var prog = MakeProgram("main",
+            new Binary(BinaryOp.Mul, U16("a"), U16("b"), U32("d")));
+        var asm = Compile(prog);
+
+        var lines = asm.Split('\n').Select(l => l.Trim()).ToList();
+        int firstAdd = lines.FindIndex(l => l.StartsWith("ADDWF\t__mul_r,"));
+        int carryToTop = lines.FindIndex(l => l.StartsWith("ADDWFC\t__mul_r+3"));
+        Assert.True(firstAdd >= 0 && carryToTop > firstAdd,
+            "the carry out of the low byte must reach the top byte of the product");
     }
 
     // ─── 32-bit integers ──────────────────────────────────────────────────────

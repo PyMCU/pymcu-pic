@@ -1273,6 +1273,46 @@ public class PIC18CodeGen : CodeGen
             Emit("MULWF", cell, GetAccessMode(cell));
         }
 
+        private bool IsStaticZeroByte(Val val, int index)
+        {
+            if (val is Constant c) return ((c.Value >> (8 * index)) & 0xFF) == 0;
+            if (val is FloatConstant) return false;
+            return index >= WidthOf(val) && !GetValType(val).IsSigned();
+        }
+
+        private void CompileWideMul32(Binary arg)
+        {
+            string result = AllocAccessScratch(MulResult, 4);
+            for (int i = 0; i < 4; ++i)
+                Emit("CLRF", Cell(result, i), GetAccessMode(result));
+
+            for (int i = 0; i < 4; ++i)
+            for (int j = 0; i + j < 4; ++j)
+            {
+                if (IsStaticZeroByte(arg.Src1, i) || IsStaticZeroByte(arg.Src2, j)) continue;
+
+                EmitPartialProduct(arg.Src1, i, arg.Src2, j);
+                int k = i + j;
+                Emit("MOVF", "PRODL", "W", "ACCESS");
+                Emit("ADDWF", Cell(result, k), "F", GetAccessMode(result));
+                if (k + 1 >= 4) continue;
+
+                Emit("MOVF", "PRODH", "W", "ACCESS");
+                Emit("ADDWFC", Cell(result, k + 1), "F", GetAccessMode(result));
+                if (k + 2 >= 4) continue;
+
+                Emit("MOVLW", "0x00");
+                for (int m = k + 2; m < 4; ++m)
+                    Emit("ADDWFC", Cell(result, m), "F", GetAccessMode(result));
+            }
+
+            for (int i = 0; i < 4; ++i)
+            {
+                Emit("MOVF", Cell(result, i), "W", GetAccessMode(result));
+                StoreWIntoByte(arg.Dst, i);
+            }
+        }
+
         private void CompileWideMul(Binary arg)
         {
             string result = AllocAccessScratch(MulResult, 2);
@@ -1556,9 +1596,15 @@ public class PIC18CodeGen : CodeGen
                     return;
                 }
 
+                if (arg.Op == PyMCU.IR.BinaryOp.Mul && wide == 4)
+                {
+                    CompileWideMul32(arg);
+                    return;
+                }
+
                 if (arg.Op == PyMCU.IR.BinaryOp.Mul && wide > 2)
                     throw new NotSupportedException(
-                        "PIC18CodeGen: Mul on operands wider than 16 bits is not implemented " +
+                        $"PIC18CodeGen: Mul into a {wide}-byte destination is not implemented " +
                         "yet for the PIC18 backend. The result would otherwise be silently " +
                         "truncated.");
             }
