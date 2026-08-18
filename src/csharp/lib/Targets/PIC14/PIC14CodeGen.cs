@@ -309,9 +309,32 @@ public class PIC14CodeGen : CodeGen
 
     // --- Config directives ---
 
+    private string ChipName()
+    {
+        if (!string.IsNullOrEmpty(Config.TargetChip)) return Config.TargetChip;
+        if (!string.IsNullOrEmpty(Config.Chip)) return Config.Chip;
+        return Config.DetectedChip;
+    }
+
+    private static readonly Dictionary<string, string[]> DefaultConfigWords =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["pic16f628a"] =
+            [
+                "_FOSC_INTOSCIO", "_WDT_OFF", "_PWRTE_ON", "_MCLRE_ON",
+                "_BOREN_OFF", "_LVP_OFF", "_CP_OFF", "_CPD_OFF",
+            ],
+        };
+
     internal void EmitConfigDirectives()
     {
-        if (Config.Fuses == null || Config.Fuses.Count == 0) return;
+        if (Config.Fuses == null || Config.Fuses.Count == 0)
+        {
+            if (DefaultConfigWords.TryGetValue(ChipName(), out var defaults))
+                EmitRaw("\t__CONFIG " + string.Join(" & ", defaults));
+
+            return;
+        }
 
         string configLine = "\t__CONFIG";
         bool first = true;

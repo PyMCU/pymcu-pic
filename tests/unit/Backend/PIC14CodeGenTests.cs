@@ -32,6 +32,37 @@ public class PIC14CodeGenTests
         return irGen.Generate(ast, new Dictionary<string, ProgramNode>(), Pic16f84a);
     }
 
+    [Fact]
+    public void Pic16f628a_EmitsItsConfigWord()
+    {
+        var prog = MakeProgram("main", new Return(new NoneVal()));
+        var asm = Compile(prog, new DeviceConfig { Chip = "pic16f628a", Arch = "pic14" });
+
+        Assert.Contains(
+            "\t__CONFIG _FOSC_INTOSCIO & _WDT_OFF & _PWRTE_ON & _MCLRE_ON & " +
+            "_BOREN_OFF & _LVP_OFF & _CP_OFF & _CPD_OFF",
+            asm);
+    }
+
+    [Fact]
+    public void ExplicitFuses_StillWinOverTheDefaults()
+    {
+        var cfg = new DeviceConfig { Chip = "pic16f628a", Arch = "pic14" };
+        cfg.Fuses["_FOSC_HS"] = "_FOSC_HS";
+        var asm = Compile(MakeProgram("main", new Return(new NoneVal())), cfg);
+
+        Assert.Contains("__CONFIG _FOSC_HS", asm);
+        Assert.DoesNotContain("_FOSC_INTOSCIO", asm);
+    }
+
+    [Fact]
+    public void ChipWithoutADefaultConfigWord_EmitsNoneAtAll()
+    {
+        var asm = Compile(MakeProgram("main", new Return(new NoneVal())));
+
+        Assert.DoesNotContain("__CONFIG", asm);
+    }
+
     private static ProgramIR MakeProgram(string name, params Instruction[] body)
     {
         var prog = new ProgramIR();
