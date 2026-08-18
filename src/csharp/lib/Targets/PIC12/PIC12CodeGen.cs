@@ -128,6 +128,80 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
     private static int StackBaseFor(string chip) =>
         StackBases.TryGetValue(chip, out int b) ? b : 0x08;
 
+    private static readonly System.Text.RegularExpressions.Regex AsmLabelDef =
+        new(@"^\s*(_[A-Za-z_][A-Za-z0-9_]*):", System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex AsmScratchRef =
+        new(@"\b__[A-Za-z_][A-Za-z0-9_]*\b", System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex AsmCodeRef =
+        new(@"\b(?:CALL|GOTO)\s+(__[A-Za-z_][A-Za-z0-9_]*)\b",
+            System.Text.RegularExpressions.RegexOptions.Compiled
+            | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    private int _asmRunCounter;
+
+    private List<Instruction> UniquifyInlineAsmLabels(List<Instruction> body)
+    {
+        var result = new List<Instruction>(body.Count);
+        int i = 0;
+        while (i < body.Count)
+        {
+            if (body[i] is not InlineAsm) { result.Add(body[i]); i++; continue; }
+
+            int start = i;
+            while (i < body.Count && body[i] is InlineAsm) i++;
+
+            var renames = new Dictionary<string, string>();
+            for (int j = start; j < i; j++)
+            {
+                var m = AsmLabelDef.Match(((InlineAsm)body[j]).Code);
+                if (m.Success && !renames.ContainsKey(m.Groups[1].Value))
+                    renames[m.Groups[1].Value] = $"{m.Groups[1].Value}_{_asmRunCounter}";
+            }
+
+            if (renames.Count > 0) _asmRunCounter++;
+
+            for (int j = start; j < i; j++)
+            {
+                var ia = (InlineAsm)body[j];
+                var code = ia.Code;
+                foreach (var (oldName, newName) in renames)
+                    code = System.Text.RegularExpressions.Regex.Replace(
+                        code, $@"\b{System.Text.RegularExpressions.Regex.Escape(oldName)}\b", newName);
+                result.Add(code == ia.Code ? ia : ia with { Code = code });
+            }
+        }
+
+        return result;
+    }
+
+    private void EmitInlineAsmScratchSymbols(ProgramIR program)
+    {
+        var definedLabels = new HashSet<string> { "__interrupt" };
+        var codeRefs = new HashSet<string>();
+        var referenced = new List<string>();
+
+        foreach (var func in program.Functions)
+        foreach (var instr in func.Body)
+        {
+            if (instr is not InlineAsm ia) continue;
+            var def = AsmLabelDef.Match(ia.Code);
+            if (def.Success) { definedLabels.Add(def.Groups[1].Value); continue; }
+            foreach (System.Text.RegularExpressions.Match m in AsmCodeRef.Matches(ia.Code))
+                codeRefs.Add(m.Groups[1].Value);
+            foreach (System.Text.RegularExpressions.Match m in AsmScratchRef.Matches(ia.Code))
+                referenced.Add(m.Value);
+        }
+
+        bool any = false;
+        foreach (var name in referenced.Distinct())
+        {
+            if (definedLabels.Contains(name) || codeRefs.Contains(name)) continue;
+            if (_stackLayout.ContainsKey(name) || _symbolTable.ContainsKey(name)) continue;
+            if (!any) { EmitComment("--- Inline-asm scratch symbols ---"); any = true; }
+            _symbolTable[name] = _ramHead++;
+            EmitRaw($"{name} EQU 0x{_symbolTable[name]:X2}");
+        }
+    }
+
     private string ChipName()
     {
         if (!string.IsNullOrEmpty(cfg.TargetChip)) return cfg.TargetChip;
@@ -138,6 +212,9 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
     public override void Compile(ProgramIR program, TextWriter output)
     {
         _assembly.Clear();
+
+        foreach (var func in program.Functions)
+            func.Body = UniquifyInlineAsmLabels(func.Body);
 
         var allocator = new StackAllocator();
         var (offsets, maxStack) = allocator.Allocate(program);
@@ -156,6 +233,8 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
         EmitRaw($"_stack_base EQU 0x{stackBase:X2}");
         foreach (var (name, offset) in _stackLayout)
             EmitRaw($"{name} EQU _stack_base + {offset}");
+
+        EmitInlineAsmScratchSymbols(program);
 
         EmitRaw("\tORG 0x00");
         Emit("GOTO", "main");
@@ -564,6 +643,17 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
         Emit("GOTO", arg.Target);
     }
 
+    // The baseline 12-bit core has no SUBLW: the literal has to travel through a
+    // scratch cell so the subtraction happens with SUBWF, which it does have.
+    private void EmitLiteralMinusSource(int literal, string sourceAddr)
+    {
+        string cell = GetOrAllocVariable("__cmp_k");
+        Emit("MOVLW", $"0x{literal & 0xFF:X2}");
+        Emit("MOVWF", cell);
+        Emit("MOVF", sourceAddr, "W");
+        Emit("SUBWF", cell, "W");
+    }
+
     private void CompileJumpIfLessThan(JumpIfLessThan arg)
     {
         if (arg.Src2 is Constant c2 && c2.Value >= 0 && c2.Value <= 255)
@@ -571,8 +661,7 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
             int k = c2.Value;
             if (k == 0) return;
             string src1 = ResolveAddress(arg.Src1);
-            Emit("MOVF", src1, "W");
-            Emit("SUBLW", $"0x{k - 1:X2}");
+            EmitLiteralMinusSource(k - 1, src1);
             Emit("BTFSC", "STATUS", "0");
             Emit("GOTO", arg.Target);
             return;
@@ -590,8 +679,7 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
         if (arg.Src2 is Constant c2 && c2.Value >= 0 && c2.Value <= 255)
         {
             string src1 = ResolveAddress(arg.Src1);
-            Emit("MOVF", src1, "W");
-            Emit("SUBLW", $"0x{c2.Value:X2}");
+            EmitLiteralMinusSource(c2.Value, src1);
             Emit("BTFSC", "STATUS", "0");
             Emit("GOTO", arg.Target);
             return;
@@ -609,8 +697,7 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
         if (arg.Src2 is Constant c2 && c2.Value >= 0 && c2.Value <= 255)
         {
             string src1 = ResolveAddress(arg.Src1);
-            Emit("MOVF", src1, "W");
-            Emit("SUBLW", $"0x{c2.Value:X2}");
+            EmitLiteralMinusSource(c2.Value, src1);
             Emit("BTFSS", "STATUS", "0");
             Emit("GOTO", arg.Target);
             return;
@@ -635,8 +722,7 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
             }
 
             string src1 = ResolveAddress(arg.Src1);
-            Emit("MOVF", src1, "W");
-            Emit("SUBLW", $"0x{k - 1:X2}");
+            EmitLiteralMinusSource(k - 1, src1);
             Emit("BTFSS", "STATUS", "0");
             Emit("GOTO", arg.Target);
             return;

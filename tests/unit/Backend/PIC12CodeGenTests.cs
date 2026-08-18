@@ -178,4 +178,82 @@ public class PIC12CodeGenTests
         Assert.True(shadowAddr >= 0x13,
             $"scratch at 0x{shadowAddr:X2} would alias the three stack slots above 0x10");
     }
+
+    [Fact]
+    public void ComparisonAgainstALiteral_AvoidsSublw_WhichTheBaselineCoreLacks()
+    {
+        var prog = MakeProgram("main",
+            new JumpIfLessThan(new Variable("n"), new Constant(100), "L"),
+            new Label("L"),
+            new Return(new NoneVal()));
+        var asm = Compile(prog);
+
+        Assert.DoesNotContain("SUBLW", asm);
+        Assert.Contains("SUBWF", asm);
+        Assert.Contains("__cmp_k", asm);
+    }
+
+    [Fact]
+    public void EveryEmittedMnemonic_BelongsToTheBaselineInstructionSet()
+    {
+        var prog = MakeProgram("main",
+            new JumpIfLessThan(new Variable("n"), new Constant(100), "L1"),
+            new JumpIfGreaterThan(new Variable("n"), new Constant(5), "L1"),
+            new JumpIfLessOrEqual(new Variable("n"), new Constant(9), "L1"),
+            new JumpIfGreaterOrEqual(new Variable("n"), new Constant(3), "L1"),
+            new Binary(BinaryOp.Add, new Variable("n"), new Constant(1), new Variable("n")),
+            new Label("L1"),
+            new Return(new NoneVal()));
+        var asm = Compile(prog);
+
+        var baseline = new HashSet<string>
+        {
+            "ADDWF", "ANDWF", "CLRF", "CLRW", "COMF", "DECF", "DECFSZ", "INCF", "INCFSZ",
+            "IORWF", "MOVF", "MOVWF", "NOP", "RLF", "RRF", "SUBWF", "SWAPF", "XORWF",
+            "BCF", "BSF", "BTFSC", "BTFSS", "ANDLW", "CALL", "CLRWDT", "GOTO", "IORLW",
+            "MOVLW", "OPTION", "RETLW", "SLEEP", "TRIS", "XORLW",
+        };
+
+        foreach (var line in asm.Split('\n'))
+        {
+            var t = line.Trim();
+            if (t.Length == 0 || t.StartsWith(";") || t.EndsWith(":")) continue;
+            var mnem = t.Split('\t', ' ')[0].Trim().ToUpperInvariant();
+            if (mnem.Length == 0 || t.Contains("EQU") || mnem.StartsWith("#")) continue;
+            if (mnem is "LIST" or "ORG" or "END" or "__CONFIG") continue;
+            Assert.True(baseline.Contains(mnem),
+                $"'{mnem}' is not one of the 33 baseline instructions");
+        }
+    }
+
+    [Fact]
+    public void InlineAsmLabels_AreUniquePerExpansion()
+    {
+        var prog = MakeProgram("main",
+            new InlineAsm("_dly_inner:"),
+            new InlineAsm("\tDECFSZ __dly_c1, F"),
+            new InlineAsm("\tGOTO _dly_inner"),
+            new Copy(new Constant(1), new Variable("x")),
+            new InlineAsm("_dly_inner:"),
+            new InlineAsm("\tDECFSZ __dly_c1, F"),
+            new InlineAsm("\tGOTO _dly_inner"),
+            new Return(new NoneVal()));
+        var asm = Compile(prog);
+
+        var defs = asm.Split('\n').Where(l => l.TrimEnd().EndsWith(":") && l.Contains("_dly_inner"))
+            .Select(l => l.Trim()).ToList();
+        Assert.Equal(2, defs.Count);
+        Assert.NotEqual(defs[0], defs[1]);
+    }
+
+    [Fact]
+    public void InlineAsmScratchCells_GetTheirEqu()
+    {
+        var prog = MakeProgram("main",
+            new InlineAsm("\tMOVWF __dly_c1"),
+            new Return(new NoneVal()));
+        var asm = Compile(prog);
+
+        Assert.Contains("__dly_c1 EQU", asm);
+    }
 }
