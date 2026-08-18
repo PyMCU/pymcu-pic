@@ -361,9 +361,11 @@ public class PIC14CodeGen : CodeGen
     {
         foreach (var func in program.Functions)
         foreach (var instr in func.Body)
-            if (instr is Call { FunctionName: "__pymcu_unhandled_exn" })
+            if (instr is Call { FunctionName: "__pymcu_unhandled_exn" }
+                or BranchOnError { ErrorLabel: "__pymcu_unhandled_exn" })
                 throw new NotSupportedException(
-                    "PIC14CodeGen: try/except and raise are not implemented yet for the PIC14 " +
+                    "PIC14CodeGen: runtime exceptions (try/except, and a raise that survives to " +
+                    "run time) are not implemented yet for the PIC14 " +
                     "backend. The error-propagation runtime (__pymcu_unhandled_exn) has no PIC " +
                     "definition, so the program would otherwise fail with an opaque gpasm " +
                     "\"Symbol not previously defined\" error at assembly time.");
