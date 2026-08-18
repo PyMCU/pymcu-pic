@@ -122,11 +122,17 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
         Emit("MOVWF", addr);
     }
 
-    private static readonly Dictionary<string, int> StackBases =
-        new(StringComparer.OrdinalIgnoreCase) { ["pic10f200"] = 0x10 };
+    // First GPR and how many, taken from the gputils headers (__BADRAM/__MAXRAM).
+    // DeviceConfig.RamSize never reaches this backend -- neither device_info() nor the
+    // driver carries it -- so the size lives here until that plumbing exists.
+    private static readonly Dictionary<string, (int Base, int Size)> RamMap =
+        new(StringComparer.OrdinalIgnoreCase) { ["pic10f200"] = (0x10, 16) };
 
     private static int StackBaseFor(string chip) =>
-        StackBases.TryGetValue(chip, out int b) ? b : 0x08;
+        RamMap.TryGetValue(chip, out var r) ? r.Base : 0x08;
+
+    private static int RamSizeFor(string chip, int fromConfig) =>
+        RamMap.TryGetValue(chip, out var r) ? r.Size : fromConfig;
 
     private static readonly System.Text.RegularExpressions.Regex AsmLabelDef =
         new(@"^\s*(_[A-Za-z_][A-Za-z0-9_]*):", System.Text.RegularExpressions.RegexOptions.Compiled);
@@ -202,6 +208,22 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
         }
     }
 
+    // The PIC hardware call stack is separate from the GPR file, so every byte of
+    // data RAM is available -- but nothing else checks the total. gpasm downgrades
+    // an out-of-range EQU to a warning and still writes a hex, so a program that
+    // does not fit "builds" and then writes where there is no memory.
+    private void RejectRamOverflow(string chip, int stackBase)
+    {
+        int available = RamSizeFor(chip, cfg.RamSize);
+        if (available <= 0) return;
+        int used = _ramHead - stackBase;
+        if (used <= available) return;
+        throw new InvalidOperationException(
+            $"PIC12CodeGen: this program needs {used} bytes of data RAM but {chip} has " +
+            $"{available} (0x{stackBase:X2}-0x{stackBase + available - 1:X2}). Reduce variables " +
+            "or pick a chip with more RAM.");
+    }
+
     private string ChipName()
     {
         if (!string.IsNullOrEmpty(cfg.TargetChip)) return cfg.TargetChip;
@@ -243,6 +265,8 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
             CompileFunction(func);
 
         EmitRaw("\tEND");
+
+        RejectRamOverflow(chipName, stackBase);
 
         foreach (var line in _assembly)
             output.WriteLine(line.ToString());

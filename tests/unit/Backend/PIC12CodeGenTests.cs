@@ -256,4 +256,31 @@ public class PIC12CodeGenTests
 
         Assert.Contains("__dly_c1 EQU", asm);
     }
+
+    [Fact]
+    public void ProgramThatDoesNotFitInRam_IsRejectedInsteadOfWarned()
+    {
+        var body = new List<Instruction>();
+        for (int k = 0; k < 24; ++k)
+            body.Add(new Copy(new Constant(k), new Variable($"v{k}")));
+        body.Add(new Return(new NoneVal()));
+        var prog = MakeProgram("main", body.ToArray());
+
+        var ex = Assert.Throws<InvalidOperationException>(() => Compile(prog));
+        Assert.Contains("bytes of data RAM", ex.Message);
+        Assert.Contains("pic10f200 has 16", ex.Message);
+    }
+
+    [Fact]
+    public void ProgramThatFits_IsNotRejected()
+    {
+        var prog = MakeProgram("main",
+            new Copy(new Constant(1), new Variable("a")),
+            new Copy(new Constant(2), new Variable("b")),
+            new Return(new NoneVal()));
+
+        var asm = Compile(prog);
+
+        Assert.Contains("_stack_base EQU 0x10", asm);
+    }
 }
