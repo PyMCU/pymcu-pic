@@ -2502,6 +2502,53 @@ public class PIC14CodeGen : CodeGen
     // Midrange has no ADDWFC/SUBWFB, so each byte carries into the next with the
     // INCFSZ idiom: bump the operand by the incoming carry and, when that bump
     // wraps 0xFF to 0x00, skip the add -- the carry then rides on untouched.
+    // Same counted loop as the 16-bit shift, with the rotate chain running the
+    // whole width: low to high for <<, high to low for >>. A signed >> seeds the
+    // carry from the sign bit so the vacated bits come in as ones.
+    private void EmitWideShift(AugAssign arg, string targetAddr, int size, bool left)
+    {
+        string loopLbl = MakeLabel(left ? "augls" + size * 8 : "augrs" + size * 8);
+        string doneLbl = loopLbl + "_done";
+
+        LoadIntoW(arg.Operand);
+        GetOrAllocVariable("__tmp");
+        SelectBank("__tmp");
+        Emit("MOVWF", "__tmp");
+        EmitLabel(loopLbl);
+        Emit("MOVF", "__tmp", "F");
+        Emit("BTFSC", "STATUS", "2");
+        Emit("GOTO", doneLbl);
+
+        if (left)
+        {
+            Emit("BCF", "STATUS", "0");
+            for (int i = 0; i < size; ++i)
+            {
+                string b = ByteOperand(targetAddr, i);
+                SelectBank(b);
+                Emit("RLF", b, "F");
+            }
+        }
+        else
+        {
+            string top = ByteOperand(targetAddr, size - 1);
+            SelectBank(top);
+            if (IsSignedValue(arg.Target)) Emit("RLF", top, "W");
+            else Emit("BCF", "STATUS", "0");
+            for (int i = size - 1; i >= 0; --i)
+            {
+                string b = ByteOperand(targetAddr, i);
+                SelectBank(b);
+                Emit("RRF", b, "F");
+            }
+        }
+
+        SelectBank("__tmp");
+        Emit("DECF", "__tmp", "F");
+        Emit("GOTO", loopLbl);
+        EmitLabel(doneLbl);
+    }
+
     private void EmitWideAddSub(AugAssign arg, string targetAddr, int size, bool isSub)
     {
         int operandSize = arg.Operand is Constant ? size : GetValSize(arg.Operand);
@@ -2827,10 +2874,16 @@ public class PIC14CodeGen : CodeGen
             return;
         }
 
+        if (size >= 3 && (arg.Op == IrBinOp.LShift || arg.Op == IrBinOp.RShift))
+        {
+            EmitWideShift(arg, targetAddr, size, arg.Op == IrBinOp.LShift);
+            return;
+        }
+
         throw new NotSupportedException(
             $"PIC14: '{arg.Op}' on a {size}-byte value is not implemented for this backend. " +
-            "At this width only + and - are. The result would otherwise be computed on the low " +
-            "byte alone and the rest left as whatever the RAM held.");
+            "At this width only +, -, << and >> are. The result would otherwise be computed on " +
+            "the low byte alone and the rest left as whatever the RAM held.");
     }
 
 

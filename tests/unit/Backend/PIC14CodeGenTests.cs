@@ -554,4 +554,36 @@ public class PIC14CodeGenTests
         Assert.Contains("low byte alone", ex.Message);
     }
 
+
+    [Fact]
+    public void WideShiftLeft_RotatesEveryByteLowToHigh()
+    {
+        var prog = MakeProgram("main",
+            new AugAssign(PyMCU.IR.BinaryOp.LShift, new Variable("v", DataType.UINT32), new Constant(1)),
+            new Return(new NoneVal()));
+        var asm = Compile(prog, Pic628);
+
+        Assert.Equal(4, asm.Split('\n').Count(l => l.Contains("RLF\tv")));
+        Assert.Contains("BCF\tSTATUS, 0", asm);
+        var lines = asm.Split('\n').Select(l => l.Trim()).ToList();
+        Assert.True(lines.FindIndex(l => l.StartsWith("RLF\tv,")) <
+                    lines.FindIndex(l => l.StartsWith("RLF\tv+3")),
+            "a left shift must rotate from the low byte upward");
+    }
+
+    [Fact]
+    public void WideShiftRight_RotatesHighToLow_AndSeedsTheSignForSignedValues()
+    {
+        var unsigned = Compile(MakeProgram("main",
+            new AugAssign(PyMCU.IR.BinaryOp.RShift, new Variable("v", DataType.UINT32), new Constant(1)),
+            new Return(new NoneVal())), Pic628);
+        var signed = Compile(MakeProgram("main",
+            new AugAssign(PyMCU.IR.BinaryOp.RShift, new Variable("v", DataType.INT32), new Constant(1)),
+            new Return(new NoneVal())), Pic628);
+
+        Assert.Equal(4, unsigned.Split('\n').Count(l => l.Contains("RRF\tv")));
+        Assert.Contains("BCF\tSTATUS, 0", unsigned);
+        Assert.Contains("RLF\tv+3, W", signed);
+        Assert.DoesNotContain("BCF\tSTATUS, 0", signed);
+    }
 }
