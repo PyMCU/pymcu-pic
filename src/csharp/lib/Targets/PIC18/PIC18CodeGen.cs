@@ -497,6 +497,23 @@ public class PIC18CodeGen : CodeGen
             }
         }
 
+        // GPR space is linear from _stack_base upward; the SFRs start where the
+        // header's __BADRAM does. gpasm downgrades an out-of-range EQU to a warning
+        // and still writes a hex, so without this a program that does not fit
+        // "builds" and then writes where there is no memory.
+        private static readonly Dictionary<string, int> RamEndExclusive =
+            new(StringComparer.OrdinalIgnoreCase) { ["pic18f45k50"] = 0x800 };
+
+        private void RejectRamOverflow()
+        {
+            if (!RamEndExclusive.TryGetValue(ChipName(), out int end)) return;
+            if (ramHead <= end) return;
+            throw new InvalidOperationException(
+                $"PIC18CodeGen: this program needs {ramHead - StackBase} bytes of data RAM but " +
+                $"{ChipName()} has {end - StackBase} (0x{StackBase:X3}-0x{end - 1:X3}). Reduce " +
+                "variables or pick a chip with more RAM.");
+        }
+
         private string ChipName()
         {
             if (!string.IsNullOrEmpty(config.TargetChip)) return config.TargetChip;
@@ -647,6 +664,8 @@ public class PIC18CodeGen : CodeGen
             // 1. Compile functions first to populate symbol_table
             foreach (var func in program.Functions)
                 CompileFunction(func);
+
+            RejectRamOverflow();
             ProtectInterruptScratch(program);
             var functionCode = new List<PIC18AsmLine>(assembly);
             assembly.Clear();

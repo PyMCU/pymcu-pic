@@ -309,6 +309,23 @@ public class PIC14CodeGen : CodeGen
 
     // --- Config directives ---
 
+    // End of the bank-0 GPR window and where the common scratch block can live,
+    // read off the gputils headers (__BADRAM). DeviceConfig.RamSize never reaches
+    // this backend, so the old `RamSize < 96` test was permanently false and every
+    // chip got the large-chip layout -- which on the 16F84A puts the scratch block
+    // at 0x70, inside __BADRAM 0x50-0x7F.
+    private static readonly Dictionary<string, (int Bank0End, int ScratchBase)> Bank0Map =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["pic16f84a"] = (0x50, 0x48),
+            ["pic16f877a"] = (0x80, 0x70),
+            ["pic16f628a"] = (0x80, 0x70),
+            ["pic16f18877"] = (0x80, 0x70),
+        };
+
+    private static (int Bank0End, int ScratchBase) Bank0MapFor(string chip) =>
+        Bank0Map.TryGetValue(chip, out var m) ? m : (0x80, 0x70);
+
     private string ChipName()
     {
         if (!string.IsNullOrEmpty(Config.TargetChip)) return Config.TargetChip;
@@ -419,7 +436,7 @@ public class PIC14CodeGen : CodeGen
 
         // Common-RAM scratch window for the software mul/div routines and the
         // array-index scaler. See the field comments for the placement rules.
-        _scratchBase = Config.RamSize > 0 && Config.RamSize < 96 ? 0x48 : 0x70;
+        _scratchBase = Bank0MapFor(ChipName()).ScratchBase;
         ScanForSoftwareRoutines(program);
 
         // Advance ram_head past the stack (and float workspace) to prevent
@@ -581,7 +598,7 @@ public class PIC14CodeGen : CodeGen
         // window instead of silently aliasing SFRs or the scratch block.
         int ramLimit = NeedsMulDivScratch || _needsArrIdxScale
             ? _scratchBase
-            : (Config.RamSize > 0 && Config.RamSize < 96 ? 0x50 : 0x80);
+            : Bank0MapFor(ChipName()).Bank0End;
         if (_ramHead > ramLimit)
             throw new InvalidOperationException(
                 $"PIC14: RAM allocation overflows the bank-0 window " +

@@ -452,6 +452,20 @@ public class PIC18CodeGenTests
     // ─── Exceptions ───────────────────────────────────────────────────────────
 
     [Fact]
+    public void ProgramThatDoesNotFitInRam_IsRejectedInsteadOfWrittenPastTheEnd()
+    {
+        var body = new List<Instruction>();
+        for (int k = 0; k < 2100; ++k)
+            body.Add(new Copy(new Constant(k & 0xFF), new Variable($"v{k}")));
+        body.Add(new Return(new NoneVal()));
+        var prog = MakeProgram("main", body.ToArray());
+
+        var ex = Assert.Throws<InvalidOperationException>(() => Compile(prog));
+        Assert.Contains("bytes of data RAM", ex.Message);
+        Assert.Contains("pic18f45k50", ex.Message);
+    }
+
+    [Fact]
     public void UnhandledExceptionBranch_ParksAtTheTrap_NotAtAnUndefinedSymbol()
     {
         var prog = MakeProgram("main",

@@ -469,4 +469,19 @@ public class PIC14CodeGenTests
             count++;
         return count;
     }
+
+    [Fact]
+    public void SmallChipScratch_StaysOutOfItsBadRamWindow()
+    {
+        var asm = Compile(MakeProgram("main",
+            new Binary(PyMCU.IR.BinaryOp.Mul, new Variable("a"), new Variable("b"), new Variable("d")),
+            new Return(new NoneVal())),
+            new DeviceConfig { Chip = "pic16f84a", Arch = "pic14" });
+
+        // 0x50-0x7F is __BADRAM on the 16F84A: the scratch block must sit below it
+        var m = System.Text.RegularExpressions.Regex.Match(asm, @"__m_a EQU 0x([0-9A-F]{2})");
+        Assert.True(m.Success, "the mul scratch block must be allocated");
+        Assert.True(Convert.ToInt32(m.Groups[1].Value, 16) < 0x50,
+            $"scratch at 0x{m.Groups[1].Value} is inside __BADRAM on the 16F84A");
+    }
 }
