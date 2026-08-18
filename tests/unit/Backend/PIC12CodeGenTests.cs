@@ -140,4 +140,42 @@ public class PIC12CodeGenTests
         Assert.True(asm.IndexOf("CLRF\td", StringComparison.Ordinal)
                     < asm.IndexOf("SUBWF\ta, W", StringComparison.Ordinal));
     }
+
+    [Fact]
+    public void Prologue_NamesTheProcessorAndItsGputilsHeader()
+    {
+        var asm = Compile(MakeProgram("main", new Return(new NoneVal())));
+
+        Assert.Contains("LIST P=pic10f200", asm);
+        Assert.Contains("#include <p10f200.inc>", asm);
+        Assert.DoesNotContain("xc.inc", asm);
+        Assert.DoesNotContain("PROCESSOR \n", asm);
+    }
+
+    [Fact]
+    public void Prologue_StartsRamWhereTheChipHasIt()
+    {
+        var asm = Compile(MakeProgram("main", new Return(new NoneVal())));
+
+        // 0x08-0x0F is BADRAM on the 10F200; its GPRs start at 0x10
+        Assert.Contains("_stack_base EQU 0x10", asm);
+    }
+
+    [Fact]
+    public void DynamicScratch_DoesNotOverlapTheCompiledStack()
+    {
+        var prog = MakeProgram("main",
+            new Copy(new Constant(1), new Variable("a")),
+            new Copy(new Constant(2), new Variable("b")),
+            new Copy(new Constant(3), new Variable("c")),
+            new Copy(new MemoryAddress(0x86, DataType.UINT8), new Variable("d")),
+            new Return(new NoneVal()));
+        var asm = Compile(prog);
+
+        var shadow = System.Text.RegularExpressions.Regex.Match(asm, @"__tris_shadow_6 EQU 0x([0-9A-F]{2})");
+        Assert.True(shadow.Success, "the TRIS shadow must be allocated");
+        int shadowAddr = Convert.ToInt32(shadow.Groups[1].Value, 16);
+        Assert.True(shadowAddr >= 0x13,
+            $"scratch at 0x{shadowAddr:X2} would alias the three stack slots above 0x10");
+    }
 }
