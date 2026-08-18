@@ -543,7 +543,12 @@ public class PIC18CodeGen : CodeGen
                 emitted.Add(key);
             }
 
-            if (!DefaultFuses.TryGetValue(ChipName(), out var defaults)) return;
+            if (!DefaultFuses.TryGetValue(ChipName(), out var defaults))
+            {
+                if (emitted.Count == 0) PicDiagnostics.WarnNoConfigWord(ChipName());
+                return;
+            }
+
             foreach (var (key, val) in defaults)
                 if (emitted.Add(key))
                     EmitRaw($"\tCONFIG {key} = {val}");

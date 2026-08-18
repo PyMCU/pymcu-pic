@@ -332,6 +332,8 @@ public class PIC14CodeGen : CodeGen
         {
             if (DefaultConfigWords.TryGetValue(ChipName(), out var defaults))
                 EmitRaw("\t__CONFIG " + string.Join(" & ", defaults));
+            else
+                Targets.PicDiagnostics.WarnNoConfigWord(ChipName());
 
             return;
         }
