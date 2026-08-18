@@ -31,6 +31,15 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
 
     private string MakeLabel(string prefix) => $"{prefix}_{_labelCounter++}";
 
+    private static bool IsSignedValue(Val val) => val switch
+    {
+        Variable v => v.Type.IsSigned(),
+        Temporary t => t.Type.IsSigned(),
+        MemoryAddress m => m.Type.IsSigned(),
+        Constant c => c.Value < 0,
+        _ => false,
+    };
+
     private void Emit(string m) => _assembly.Add(PIC12AsmLine.MakeInstruction(m));
     private void Emit(string m, string o1) => _assembly.Add(PIC12AsmLine.MakeInstruction(m, o1));
     private void Emit(string m, string o1, string o2) => _assembly.Add(PIC12AsmLine.MakeInstruction(m, o1, o2));
@@ -293,13 +302,22 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
                 StoreWInto(arg.Dst);
                 string dstAddr = ResolveAddress(arg.Dst);
                 string rotateOp = arg.Op == PyMCU.IR.BinaryOp.LShift ? "RLF" : "RRF";
+                bool arithmetic = arg.Op == PyMCU.IR.BinaryOp.RShift && IsSignedValue(arg.Src1);
 
                 if (arg.Src2 is Constant c2)
                 {
-                    int shiftCount = c2.Value & 0x07;
+                    int shiftCount = Math.Max(c2.Value, 0);
+                    if (arithmetic) shiftCount = Math.Min(shiftCount, 7);
+                    if (shiftCount >= 8)
+                    {
+                        Emit("CLRF", dstAddr);
+                        return;
+                    }
+
                     for (int i = 0; i < shiftCount; i++)
                     {
-                        Emit("BCF", "STATUS", "0");
+                        if (arithmetic) Emit("RLF", dstAddr, "W");
+                        else Emit("BCF", "STATUS", "0");
                         Emit(rotateOp, dstAddr, "F");
                     }
                 }
@@ -312,7 +330,8 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
                     Emit("BTFSC", "STATUS", "2");
                     Emit("GOTO", doneLabel);
                     EmitLabel(loopLabel);
-                    Emit("BCF", "STATUS", "0");
+                    if (arithmetic) Emit("RLF", dstAddr, "W");
+                    else Emit("BCF", "STATUS", "0");
                     Emit(rotateOp, dstAddr, "F");
                     Emit("DECFSZ", countAddr, "F");
                     Emit("GOTO", loopLabel);
@@ -329,11 +348,11 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
             case PyMCU.IR.BinaryOp.GreaterThan:
             case PyMCU.IR.BinaryOp.GreaterEqual:
             {
+                string dstAddr = ResolveAddress(arg.Dst);
+                Emit("CLRF", dstAddr);
                 LoadIntoW(arg.Src2);
                 string left = ResolveAddress(arg.Src1);
                 Emit("SUBWF", left, "W");
-                string dstAddr = ResolveAddress(arg.Dst);
-                Emit("CLRF", dstAddr);
 
                 switch (arg.Op)
                 {

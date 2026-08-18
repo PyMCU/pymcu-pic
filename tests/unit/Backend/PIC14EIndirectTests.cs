@@ -256,7 +256,7 @@ public class PIC14EIndirectTests
         var asm = Enhanced(
             new ArrayLoad("main.buf", new Variable("i"), new Variable("x"), DataType.UINT8, 8));
 
-        Assert.Contains("MOVLB 0", Lines(asm));
+        Assert.Contains("MOVLB 0x00", Lines(asm));
         AssertNoLine(asm, "BSF STATUS, 5", "BCF STATUS, 5", "BSF STATUS, 6", "BCF STATUS, 6");
     }
 }

@@ -67,9 +67,52 @@ public static class PymcuCompiler
     /// own <c>pymcu/chips/&lt;chip&gt;.py</c> for a part the stdlib does not carry.
     /// </param>
     public static string BuildSource(string mainPy, string target = "pic16f877a", int frequencyHz = 20_000_000,
-        IReadOnlyDictionary<string, string>? extraSources = null, string? stdlib = null)
-        => Cache.GetOrAdd($"src:{target}:{frequencyHz}:{stdlib}:{Sha(mainPy)}:{Sha(Flatten(extraSources))}",
-            _ => new Lazy<string>(() => CompileSource(mainPy, target, frequencyHz, extraSources, stdlib))).Value;
+        IReadOnlyDictionary<string, string>? extraSources = null, string? stdlib = null,
+        bool noPeephole = false)
+        => Cache.GetOrAdd($"src:{target}:{frequencyHz}:{stdlib}:{noPeephole}:{Sha(mainPy)}:{Sha(Flatten(extraSources))}",
+            _ => new Lazy<string>(() => CompileSource(mainPy, target, frequencyHz, extraSources, stdlib, noPeephole))).Value;
+
+    /// <summary>
+    /// Key of the throwaway project directory for a source build. The peephole switch is
+    /// part of it: the same program built both ways must not share an output directory.
+    /// </summary>
+    private static string SourceKey(string mainPy, string target, int frequencyHz,
+        IReadOnlyDictionary<string, string>? extraSources, string? stdlib, bool noPeephole)
+        => Sha($"{target}:{frequencyHz}:{stdlib}:{noPeephole}:{mainPy}:{Flatten(extraSources)}");
+
+    /// <summary>
+    /// Generated assembly (<c>dist/debug/firmware.asm</c>) for a source built with
+    /// <see cref="BuildSource"/> — for tests that assert on emitted instructions.
+    /// </summary>
+    public static string BuildSourceAsm(string mainPy, string target = "pic16f877a", int frequencyHz = 20_000_000,
+        IReadOnlyDictionary<string, string>? extraSources = null, string? stdlib = null,
+        bool noPeephole = false)
+    {
+        BuildSource(mainPy, target, frequencyHz, extraSources, stdlib, noPeephole);
+        var key = SourceKey(mainPy, target, frequencyHz, extraSources, stdlib, noPeephole);
+        var asm = Path.Combine(Path.GetTempPath(), "pymcu-gen", key[..16], "dist", "debug", "firmware.asm");
+        if (!File.Exists(asm))
+            throw new FileNotFoundException($"Generated assembly not found: {asm}");
+        return File.ReadAllText(asm);
+    }
+
+    /// <summary>
+    /// Generated listing (<c>dist/debug/firmware.lst</c>) for a source built with
+    /// <see cref="BuildSource"/> — for tests that must assert on the ASSEMBLED
+    /// opcode. Text anchors on the .asm pass even when gpasm silently truncates
+    /// an out-of-range operand, so anything radix-sensitive belongs here.
+    /// </summary>
+    public static string BuildSourceListing(string mainPy, string target = "pic16f877a", int frequencyHz = 20_000_000,
+        IReadOnlyDictionary<string, string>? extraSources = null, string? stdlib = null,
+        bool noPeephole = false)
+    {
+        BuildSource(mainPy, target, frequencyHz, extraSources, stdlib, noPeephole);
+        var key = SourceKey(mainPy, target, frequencyHz, extraSources, stdlib, noPeephole);
+        var lst = Path.Combine(Path.GetTempPath(), "pymcu-gen", key[..16], "dist", "debug", "firmware.lst");
+        if (!File.Exists(lst))
+            throw new FileNotFoundException($"Generated listing not found: {lst}");
+        return File.ReadAllText(lst);
+    }
 
     private static string Sha(string s)
     {
@@ -84,9 +127,10 @@ public static class PymcuCompiler
                                        .Select(kv => kv.Key + "\0" + kv.Value));
 
     private static string CompileSource(string mainPy, string target, int frequencyHz,
-        IReadOnlyDictionary<string, string>? extraSources, string? stdlib = null)
+        IReadOnlyDictionary<string, string>? extraSources, string? stdlib = null,
+        bool noPeephole = false)
     {
-        var key = Sha($"{target}:{frequencyHz}:{stdlib}:{mainPy}:{Flatten(extraSources)}");
+        var key = SourceKey(mainPy, target, frequencyHz, extraSources, stdlib, noPeephole);
         var dir = Path.Combine(Path.GetTempPath(), "pymcu-gen", key[..16]);
         Directory.CreateDirectory(Path.Combine(dir, "src"));
         File.WriteAllText(Path.Combine(dir, "pyproject.toml"),
@@ -112,15 +156,15 @@ public static class PymcuCompiler
             }
         }
 
-        return Compile(dir, "gen-" + key[..8]);
+        return Compile(dir, "gen-" + key[..8], noPeephole);
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
 
-    private static string Compile(string exampleDir, string name)
+    private static string Compile(string exampleDir, string name, bool noPeephole = false)
     {
         BuildGate.Wait();
-        try { return CompileImpl(exampleDir, name); }
+        try { return CompileImpl(exampleDir, name, noPeephole); }
         finally { BuildGate.Release(); }
     }
 
@@ -131,7 +175,7 @@ public static class PymcuCompiler
         Environment.GetEnvironmentVariable("PYMCU_VERBOSE") == "1" ||
         Environment.GetEnvironmentVariable("RUNNER_DEBUG")  == "1";
 
-    private static string CompileImpl(string exampleDir, string name)
+    private static string CompileImpl(string exampleDir, string name, bool noPeephole = false)
     {
         if (!Directory.Exists(exampleDir))
             throw new DirectoryNotFoundException(
@@ -151,6 +195,8 @@ public static class PymcuCompiler
         };
         if (Verbose)
             psi.Environment["PYMCU_VERBOSE"] = "1";
+        if (noPeephole)
+            psi.Environment["PYMCU_NO_PEEPHOLE"] = "1";
         psi.Environment["PATH"] = venvBin + Path.PathSeparator + psi.Environment["PATH"];
 
         using var proc = Process.Start(psi)

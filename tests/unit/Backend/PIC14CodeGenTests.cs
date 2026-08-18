@@ -181,4 +181,184 @@ public class PIC14CodeGenTests
         Assert.Contains("MOVWF\tadd.b", asm);
         Assert.Contains("CALL\tadd", asm);
     }
+
+    // ─── Shift semantics ──────────────────────────────────────────────────────
+
+    private static readonly DeviceConfig Pic16f877a =
+        new() { Chip = "pic16f877a", Arch = "pic14", RamSize = 368 };
+
+    private static string CompileWide(params Instruction[] body)
+    {
+        var prog = new ProgramIR();
+        prog.Functions.Add(new Function { Name = "main", Body = body.ToList() });
+        return Compile(prog, Pic16f877a);
+    }
+
+    [Fact]
+    public void ShiftLeft_ByEight_YieldsZero()
+    {
+        var asm = CompileWide(new Binary(IrBinaryOp.LShift,
+            new Variable("x"), new Constant(8), new Variable("d")));
+
+        Assert.Contains("CLRF\td", asm);
+        Assert.DoesNotContain("RLF\td, F", asm);
+    }
+
+    [Fact]
+    public void ShiftRight_ByEight_OnByte_YieldsZeroInsteadOfReadingPastTheVariable()
+    {
+        var asm = CompileWide(new Binary(IrBinaryOp.RShift,
+            new Variable("x", DataType.UINT8), new Constant(8), new Variable("d")));
+
+        Assert.Contains("CLRF\td", asm);
+        Assert.DoesNotContain("x+1", asm);
+    }
+
+    [Fact]
+    public void ShiftRight_ByEight_OnWord_StillReadsTheHighByte()
+    {
+        var asm = CompileWide(new Binary(IrBinaryOp.RShift,
+            new Variable("x", DataType.UINT16), new Constant(8), new Variable("d")));
+
+        Assert.Contains("MOVF\tx+1, W", asm);
+    }
+
+    [Fact]
+    public void ShiftRight_Signed_IsArithmetic()
+    {
+        var asm = CompileWide(new Binary(IrBinaryOp.RShift,
+            new Variable("x", DataType.INT8), new Constant(2), new Variable("d", DataType.INT8)));
+
+        Assert.Equal(2, CountOf(asm, "RLF\td, W"));
+        Assert.Equal(2, CountOf(asm, "RRF\td, F"));
+        Assert.DoesNotContain("BCF\tSTATUS, 0", asm);
+    }
+
+    [Fact]
+    public void ShiftRight_Signed_ByNine_SaturatesToSignBits()
+    {
+        var asm = CompileWide(new Binary(IrBinaryOp.RShift,
+            new Variable("x", DataType.INT8), new Constant(9), new Variable("d", DataType.INT8)));
+
+        Assert.Equal(7, CountOf(asm, "RRF\td, F"));
+        Assert.DoesNotContain("CLRF\td", asm);
+    }
+
+    [Fact]
+    public void ShiftRight_Unsigned_StaysLogical()
+    {
+        var asm = CompileWide(new Binary(IrBinaryOp.RShift,
+            new Variable("x", DataType.UINT8), new Constant(2), new Variable("d")));
+
+        Assert.Contains("BCF\tSTATUS, 0", asm);
+        Assert.DoesNotContain("RLF\td, W", asm);
+    }
+
+    [Fact]
+    public void VariableShift_Signed_IsArithmetic()
+    {
+        var asm = CompileWide(new Binary(IrBinaryOp.RShift,
+            new Variable("x", DataType.INT8), new Variable("n"), new Variable("d", DataType.INT8)));
+
+        Assert.Contains("RLF\td, W", asm);
+    }
+
+    [Fact]
+    public void AugAssign_SignedShiftRight_IsArithmetic()
+    {
+        var asm = CompileWide(new AugAssign(IrBinaryOp.RShift,
+            new Variable("x", DataType.INT8), new Constant(1)));
+
+        Assert.Contains("RLF\tx, W", asm);
+    }
+
+    // ─── Signed comparisons ───────────────────────────────────────────────────
+
+    [Fact]
+    public void SignedJumpIfLessThan_Constant_BiasesBothSides()
+    {
+        var asm = CompileWide(
+            new JumpIfLessThan(new Variable("a", DataType.INT8), new Constant(1), "L"),
+            new IR.Label("L"));
+
+        Assert.Contains("XORLW\t0x80", asm);
+        Assert.Contains("SUBLW\t0x80", asm);
+    }
+
+    [Fact]
+    public void UnsignedJumpIfLessThan_Constant_IsUnchanged()
+    {
+        var asm = CompileWide(
+            new JumpIfLessThan(new Variable("a", DataType.UINT8), new Constant(1), "L"),
+            new IR.Label("L"));
+
+        Assert.DoesNotContain("XORLW\t0x80", asm);
+        Assert.Contains("SUBLW\t0x00", asm);
+    }
+
+    [Fact]
+    public void SignedCompare_Registers_BiasesThroughCommonRamCell()
+    {
+        var asm = CompileWide(new Binary(IrBinaryOp.LessThan,
+            new Variable("a", DataType.INT8), new Variable("b", DataType.INT8), new Variable("d")));
+
+        Assert.Contains("__s_cmp EQU", asm);
+        Assert.Equal(2, CountOf(asm, "XORLW\t0x80"));
+        Assert.Contains("SUBWF\t__s_cmp, W", asm);
+    }
+
+    [Fact]
+    public void SignedCompare_Wide_BiasesOnlyTheHighByte()
+    {
+        var asm = CompileWide(new Binary(IrBinaryOp.LessThan,
+            new Variable("a", DataType.INT16), new Variable("b", DataType.INT16), new Variable("d")));
+
+        Assert.Contains("MOVF\ta+1, W", asm);
+        Assert.Equal(2, CountOf(asm, "XORLW\t0x80"));
+        Assert.Contains("SUBWF\ta, W", asm);
+    }
+
+    [Fact]
+    public void MaterializedSignedLessThan_AgainstZero_ComparesAsSigned()
+    {
+        var asm = CompileWide(new Binary(IrBinaryOp.LessThan,
+            new Variable("a", DataType.INT8), new Constant(0), new Variable("d")));
+
+        Assert.Contains("XORLW\t0x80", asm);
+        Assert.Contains("SUBLW\t0x7F", asm);
+    }
+
+    // ─── Exceptions ───────────────────────────────────────────────────────────
+
+    [Fact]
+    public void UnhandledExceptionTrampoline_IsRejectedInsteadOfEmittingAnUndefinedSymbol()
+    {
+        var ex = Assert.Throws<NotSupportedException>(() => CompileWide(
+            new Call("__pymcu_unhandled_exn", new List<Val>(), new NoneVal()),
+            new Return(new NoneVal())));
+
+        Assert.Contains("__pymcu_unhandled_exn", ex.Message);
+    }
+
+    // ─── Floating point ───────────────────────────────────────────────────────
+
+    [Fact]
+    public void TrueDivision_IsRejectedWithAnActionableMessage()
+    {
+        var ex = Assert.Throws<NotSupportedException>(() => CompileWide(
+            new Binary(IrBinaryOp.Div, new Temporary("t", DataType.FLOAT), new Constant(7),
+                new Variable("q"))));
+
+        Assert.Contains("true division", ex.Message);
+        Assert.Contains("Use '//' for integer division", ex.Message);
+    }
+
+    private static int CountOf(string haystack, string needle)
+    {
+        int count = 0;
+        for (int i = haystack.IndexOf(needle, StringComparison.Ordinal); i >= 0;
+             i = haystack.IndexOf(needle, i + needle.Length, StringComparison.Ordinal))
+            count++;
+        return count;
+    }
 }

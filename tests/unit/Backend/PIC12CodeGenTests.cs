@@ -94,4 +94,50 @@ public class PIC12CodeGenTests
         Assert.DoesNotContain("MOVWF\t0x07", asm);
         Assert.Contains("__neg_temp", asm);
     }
+
+    // ─── Shift semantics ──────────────────────────────────────────────────────
+
+    [Fact]
+    public void ShiftLeft_ByEight_YieldsZero()
+    {
+        var prog = MakeProgram("main",
+            new Binary(BinaryOp.LShift, new Variable("x"), new Constant(8), new Variable("d")));
+        var asm = Compile(prog);
+
+        Assert.Contains("CLRF\td", asm);
+        Assert.DoesNotContain("RLF\td, F", asm);
+    }
+
+    [Fact]
+    public void ShiftRight_ByNine_YieldsZero()
+    {
+        var prog = MakeProgram("main",
+            new Binary(BinaryOp.RShift, new Variable("x"), new Constant(9), new Variable("d")));
+        var asm = Compile(prog);
+
+        Assert.Contains("CLRF\td", asm);
+        Assert.DoesNotContain("RRF\td, F", asm);
+    }
+
+    [Fact]
+    public void ShiftRight_Signed_IsArithmetic()
+    {
+        var prog = MakeProgram("main",
+            new Binary(BinaryOp.RShift, new Variable("x", DataType.INT8), new Constant(2), new Variable("d", DataType.INT8)));
+        var asm = Compile(prog);
+
+        Assert.Contains("RLF\td, W", asm);
+        Assert.DoesNotContain("BCF\tSTATUS, 0", asm);
+    }
+
+    [Fact]
+    public void MaterializedEqual_ClearsTheDestinationBeforeTheSubtract()
+    {
+        var prog = MakeProgram("main",
+            new Binary(BinaryOp.Equal, new Variable("a"), new Variable("b"), new Variable("d")));
+        var asm = Compile(prog);
+
+        Assert.True(asm.IndexOf("CLRF\td", StringComparison.Ordinal)
+                    < asm.IndexOf("SUBWF\ta, W", StringComparison.Ordinal));
+    }
 }

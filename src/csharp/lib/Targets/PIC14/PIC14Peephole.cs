@@ -264,7 +264,7 @@ public class PIC14EStrategy : ArchStrategy
         // Optimization: Track current_bsr to avoid redundant MOVLB
         if (_currentBsr != bank)
         {
-            _codegen.Emit("MOVLB", bank.ToString());
+            _codegen.Emit("MOVLB", $"0x{bank:X2}");
             _currentBsr = bank;
         }
     }
@@ -357,6 +357,15 @@ public class PIC14EStrategy : ArchStrategy
 
 public static class PIC14Peephole
 {
+
+    private static bool TryParseLiteral(string text, out int value)
+    {
+        text = text.Trim();
+        if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            return int.TryParse(text.AsSpan(2), System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out value);
+        return int.TryParse(text, out value);
+    }
     private static List<PIC14AsmLine> CoalesceBitOps(List<PIC14AsmLine> lines)
     {
         var result = new List<PIC14AsmLine>();
@@ -433,8 +442,18 @@ public static class PIC14Peephole
         return result;
     }
 
+    /// <summary>
+    /// <c>PYMCU_NO_PEEPHOLE=1</c> hands the assembly straight through, so a miscompile
+    /// can be bisected to this file (wrong only after the peephole) versus the code
+    /// generator (already wrong before it).
+    /// </summary>
+    private static bool Bypassed =>
+        Environment.GetEnvironmentVariable("PYMCU_NO_PEEPHOLE") == "1";
+
     public static List<PIC14AsmLine> Optimize(List<PIC14AsmLine> lines)
     {
+        if (Bypassed) return new List<PIC14AsmLine>(lines);
+
         var result = new List<PIC14AsmLine>(CoalesceBitOps(lines));
         bool changed = true;
 
@@ -605,7 +624,7 @@ public static class PIC14Peephole
                 // --- Bank tracking (PIC14E MOVLB) ---
                 if (current.Mnemonic == "MOVLB")
                 {
-                    if (int.TryParse(current.Op1, out int bank))
+                    if (TryParseLiteral(current.Op1, out int bank))
                     {
                         if (currentMovlb.HasValue && currentMovlb.Value == bank)
                         {

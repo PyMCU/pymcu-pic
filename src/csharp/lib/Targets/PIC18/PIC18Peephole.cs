@@ -1,3 +1,4 @@
+using System;
 /*
  * -----------------------------------------------------------------------------
  * PyMCU Compiler (pymcuc)
@@ -81,8 +82,33 @@ public class PIC18AsmLine
 
 public static class PIC18Peephole
 {
+    private static readonly HashSet<string> SkipMnemonics = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "BTFSC", "BTFSS", "CPFSEQ", "CPFSGT", "CPFSLT",
+        "DECFSZ", "DCFSNZ", "INCFSZ", "INFSNZ", "TSTFSZ",
+    };
+
+    private static bool TryParseLiteral(string text, out int value)
+    {
+        text = text.Trim();
+        if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            return int.TryParse(text.AsSpan(2), System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out value);
+        return int.TryParse(text, out value);
+    }
+
+    /// <summary>
+    /// <c>PYMCU_NO_PEEPHOLE=1</c> hands the assembly straight through, so a miscompile
+    /// can be bisected to this file (wrong only after the peephole) versus the code
+    /// generator (already wrong before it).
+    /// </summary>
+    private static bool Bypassed =>
+        Environment.GetEnvironmentVariable("PYMCU_NO_PEEPHOLE") == "1";
+
     public static List<PIC18AsmLine> Optimize(List<PIC18AsmLine> lines)
     {
+        if (Bypassed) return new List<PIC18AsmLine>(lines);
+
         var source = new List<PIC18AsmLine>(lines);
         var result = new List<PIC18AsmLine>();
         bool changed = true;
@@ -94,10 +120,11 @@ public static class PIC18Peephole
 
             int? currentBsr = null;
             bool deadCodeMode = false;
+            bool afterSkip = false;
 
             foreach (var current in source)
             {
-                if (current.Type == PIC18AsmLine.LineType.Label)
+                if (current.Type is PIC18AsmLine.LineType.Label or PIC18AsmLine.LineType.Raw)
                 {
                     deadCodeMode = false;
                     currentBsr = null;
@@ -128,7 +155,7 @@ public static class PIC18Peephole
 
                 if (current.Mnemonic == "MOVLB")
                 {
-                    if (int.TryParse(current.Op1, out int bank))
+                    if (TryParseLiteral(current.Op1, out int bank))
                     {
                         if (currentBsr.HasValue && currentBsr.Value == bank)
                         {
@@ -141,8 +168,10 @@ public static class PIC18Peephole
                     else currentBsr = null;
                 }
 
-                if (current.Mnemonic is "RETURN" or "RETFIE" or "GOTO" or "BRA")
+                if (!afterSkip && current.Mnemonic is "RETURN" or "RETFIE" or "GOTO" or "BRA")
                     deadCodeMode = true;
+
+                afterSkip = SkipMnemonics.Contains(current.Mnemonic);
 
                 result.Add(current);
             }

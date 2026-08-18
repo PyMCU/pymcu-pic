@@ -51,6 +51,7 @@ public class PIC14CodeGen : CodeGen
     // bank 1) the scratch block moves to the top of bank 0 instead — those
     // GPRs are bank-mirrored too, so the "no bank select" property holds.
     private bool _needsMul8, _needsDiv8, _needsMul16, _needsDiv16, _needsArrIdxScale;
+    private bool _needsSignedCmp;
     private int _scratchBase;
     private bool NeedsMulDivScratch => _needsMul8 || _needsDiv8 || _needsMul16 || _needsDiv16;
     private string ScratchA => "__m_a";   // 2 bytes: mul multiplicand / div dividend->quotient
@@ -58,6 +59,7 @@ public class PIC14CodeGen : CodeGen
     private string ScratchR => "__m_r";   // 2 bytes: mul product / div remainder
     private string ScratchC => "__m_c";   // 1 byte : div bit counter
     private string ScratchIdx => "__arr_i"; // 1 byte: scaled array index (16-bit elements)
+    private string ScratchCmp => "__s_cmp";
 
     // --- Flash tables (const[str] / const[uint8[N]]) -------------------------
     //
@@ -328,8 +330,21 @@ public class PIC14CodeGen : CodeGen
 
     // --- Main Compile entry point ---
 
+    private static void RejectExceptions(ProgramIR program)
+    {
+        foreach (var func in program.Functions)
+        foreach (var instr in func.Body)
+            if (instr is Call { FunctionName: "__pymcu_unhandled_exn" })
+                throw new NotSupportedException(
+                    "PIC14CodeGen: try/except and raise are not implemented yet for the PIC14 " +
+                    "backend. The error-propagation runtime (__pymcu_unhandled_exn) has no PIC " +
+                    "definition, so the program would otherwise fail with an opaque gpasm " +
+                    "\"Symbol not previously defined\" error at assembly time.");
+    }
+
     public override void Compile(ProgramIR program, TextWriter output)
     {
+        RejectExceptions(program);
         _assembly.Clear();
         _flashData.Clear();
         _flashDataNames.Clear();
@@ -528,8 +543,7 @@ public class PIC14CodeGen : CodeGen
         // Flash RETLW tables (const[str] / const[uint8[N]]), at the very end.
         EmitFlashTables();
 
-        if (_usesFloat)
-            EmitRaw("#include \"float.inc\"");
+
 
         EmitRaw("\tEND");
 
@@ -633,6 +647,14 @@ public class PIC14CodeGen : CodeGen
     private int MulDivOpSize(Val src1, Val src2, Val dst) =>
         Math.Max(GetValSize(dst), Math.Max(GetValSize(src1), GetValSize(src2)));
 
+    private static bool IsRelationalOp(IrBinOp op) =>
+        op is IrBinOp.LessThan or IrBinOp.LessEqual or IrBinOp.GreaterThan or IrBinOp.GreaterEqual;
+
+    private void RecordSignedCmp(Val src1, Val src2)
+    {
+        if (IsSignedComparison(src1, src2)) _needsSignedCmp = true;
+    }
+
     private void RecordMulDiv(IrBinOp op, int size)
     {
         if (op == IrBinOp.Mul)
@@ -672,13 +694,20 @@ public class PIC14CodeGen : CodeGen
                 case ArrayStore ast when ast.Index is not Constant && ast.ElemType.SizeOf() == 2:
                     _needsArrIdxScale = true;
                     break;
+                case Binary cb when IsRelationalOp(cb.Op):
+                    RecordSignedCmp(cb.Src1, cb.Src2);
+                    break;
+                case JumpIfLessThan jlt: RecordSignedCmp(jlt.Src1, jlt.Src2); break;
+                case JumpIfLessOrEqual jle: RecordSignedCmp(jle.Src1, jle.Src2); break;
+                case JumpIfGreaterThan jgt: RecordSignedCmp(jgt.Src1, jgt.Src2); break;
+                case JumpIfGreaterOrEqual jge: RecordSignedCmp(jge.Src1, jge.Src2); break;
             }
         }
     }
 
     private void EmitScratchSymbols()
     {
-        if (!NeedsMulDivScratch && !_needsArrIdxScale) return;
+        if (!NeedsMulDivScratch && !_needsArrIdxScale && !_needsSignedCmp) return;
 
         EmitComment("--- Common-RAM scratch (bank-independent) ---");
         if (NeedsMulDivScratch)
@@ -697,6 +726,12 @@ public class PIC14CodeGen : CodeGen
         {
             _symbolTable[ScratchIdx] = _scratchBase + 7;
             EmitRaw($"{ScratchIdx} EQU 0x{_scratchBase + 7:X2}");
+        }
+
+        if (_needsSignedCmp)
+        {
+            _symbolTable[ScratchCmp] = _scratchBase + 8;
+            EmitRaw($"{ScratchCmp} EQU 0x{_scratchBase + 8:X2}");
         }
 
         EmitRaw("");
@@ -1510,6 +1545,20 @@ public class PIC14CodeGen : CodeGen
         StoreWInto(arg.Dst);
     }
 
+    private static DataType GetValType(Val val) => val switch
+    {
+        Variable v => v.Type,
+        Temporary t => t.Type,
+        MemoryAddress m => m.Type,
+        _ => DataType.UINT8,
+    };
+
+    private static bool IsSignedValue(Val val) =>
+        GetValType(val).IsSigned() || (val is Constant c && c.Value < 0);
+
+    private static bool IsSignedComparison(Val src1, Val src2) =>
+        IsSignedValue(src1) || IsSignedValue(src2);
+
     // Operand size in bytes, resolved through the allocator's size table.
     private int GetValSize(Val val)
     {
@@ -1544,16 +1593,15 @@ public class PIC14CodeGen : CodeGen
 
         if (IsFloat(arg.Dst) || IsFloat(arg.Src1) || IsFloat(arg.Src2))
         {
-            if (arg.Op == IrBinOp.Add)
-            {
-                string dstAddr = ResolveAddress(arg.Dst);
-                CompileVariant(new Copy(arg.Src1, arg.Dst));
-                string src2Addr = ResolveAddress(arg.Src2);
-                EmitFloatAdd(dstAddr, src2Addr);
-                return;
-            }
+            if (arg.Op == IrBinOp.Div)
+                throw new NotSupportedException(
+                    "PIC14CodeGen: true division ('/') needs floating-point support, which the PIC14 " +
+                    "backend does not have yet. Use '//' for integer division.");
 
-            throw new NotSupportedException("PIC14: Float op not supported (only Add)");
+            throw new NotSupportedException(
+                $"PIC14CodeGen: floating-point {arg.Op} is not implemented yet for the PIC14 backend. " +
+                "No float operation is: __add_float shipped as an eight-line stub that returns its " +
+                "first operand unchanged, so the previous \"only Add is supported\" was not true.");
         }
 
         // --- Multiply / Divide / Modulo (software routines) ---
@@ -1694,13 +1742,29 @@ public class PIC14CodeGen : CodeGen
                     return;
                 }
 
-                // <, <=, >, >= (Unsigned assumed)
-                LoadByte(arg.Src2, true);
+                // <, <=, >, >=
+                bool wideSigned = IsSignedComparison(arg.Src1, arg.Src2);
                 string s1Hi = GetAddr(arg.Src1, true);
                 if (arg.Src1 is Constant cHi)
-                    Emit("SUBLW", $"0x{(cHi.Value >> 8) & 0xFF:X2}");
+                {
+                    LoadByte(arg.Src2, true);
+                    if (wideSigned) Emit("XORLW", "0x80");
+                    int kHi = ((cHi.Value >> 8) ^ (wideSigned ? 0x80 : 0x00)) & 0xFF;
+                    Emit("SUBLW", $"0x{kHi:X2}");
+                }
+                else if (wideSigned)
+                {
+                    SelectBank(s1Hi);
+                    Emit("MOVF", s1Hi, "W");
+                    Emit("XORLW", "0x80");
+                    Emit("MOVWF", ScratchCmp);
+                    LoadByte(arg.Src2, true);
+                    Emit("XORLW", "0x80");
+                    Emit("SUBWF", ScratchCmp, "W");
+                }
                 else
                 {
+                    LoadByte(arg.Src2, true);
                     SelectBank(s1Hi);
                     Emit("SUBWF", s1Hi, "W");
                 }
@@ -1765,14 +1829,19 @@ public class PIC14CodeGen : CodeGen
             string labelTrue = MakeLabel("cmp_true");
             string labelEnd = MakeLabel("cmp_end");
 
+            bool cmpSigned = IsSignedComparison(arg.Src1, arg.Src2)
+                             && arg.Op is not (IrBinOp.Equal or IrBinOp.NotEqual);
+
             // Optimization: RHS is a literal constant
             if (arg.Src2 is Constant c2Lit &&
-                (arg.Src1 is Variable || arg.Src1 is Temporary || arg.Src1 is MemoryAddress))
+                (arg.Src1 is Variable || arg.Src1 is Temporary || arg.Src1 is MemoryAddress) &&
+                (!cmpSigned || (c2Lit.Value >= -128 && c2Lit.Value <= 127)))
             {
-                int k = c2Lit.Value & 0xFF;
+                int k = (c2Lit.Value ^ (cmpSigned ? 0x80 : 0x00)) & 0xFF;
                 string srcAddr = ResolveAddress(arg.Src1);
                 SelectBank(srcAddr);
                 Emit("MOVF", srcAddr, "W");
+                if (cmpSigned) Emit("XORLW", "0x80");
 
                 if (arg.Op == IrBinOp.Equal)
                 {
@@ -1835,10 +1904,7 @@ public class PIC14CodeGen : CodeGen
             }
 
             // Generic 8-bit comparison
-            LoadIntoW(arg.Src2);
-            string addr1 = ResolveAddress(arg.Src1);
-            SelectBank(addr1);
-            Emit("SUBWF", addr1, "W");
+            EmitCompareSub(arg.Src1, arg.Src2, cmpSigned);
 
             switch (arg.Op)
             {
@@ -1892,14 +1958,25 @@ public class PIC14CodeGen : CodeGen
             if (arg.Op == IrBinOp.LShift || arg.Op == IrBinOp.RShift)
             {
                 string rotateOp = (arg.Op == IrBinOp.LShift) ? "RLF" : "RRF";
+                bool arithmetic = arg.Op == IrBinOp.RShift && IsSignedValue(arg.Src1);
 
                 if (arg.Src2 is Constant shiftC)
                 {
-                    int rawShift = shiftC.Value;
-                    int byteOffset = rawShift / 8;
-                    int bitShift = rawShift % 8;
+                    int width = GetValSize(arg.Src1);
+                    int rawShift = Math.Max(shiftC.Value, 0);
+                    if (arithmetic) rawShift = Math.Min(rawShift, 8 * width - 1);
+                    int byteOffset = arg.Op == IrBinOp.RShift ? rawShift / 8 : 0;
+                    int bitShift = arg.Op == IrBinOp.RShift ? rawShift % 8 : rawShift;
+                    string dstAddr = ResolveAddress(arg.Dst);
 
-                    if (arg.Op == IrBinOp.RShift && byteOffset > 0)
+                    if (byteOffset >= width || (arg.Op == IrBinOp.LShift && rawShift >= 8))
+                    {
+                        SelectBank(dstAddr);
+                        Emit("CLRF", dstAddr);
+                        return;
+                    }
+
+                    if (byteOffset > 0)
                     {
                         string srcAddr = ResolveAddress(arg.Src1);
                         string srcHi = srcAddr.StartsWith("0x")
@@ -1915,11 +1992,20 @@ public class PIC14CodeGen : CodeGen
 
                     StoreWInto(arg.Dst);
 
-                    string dstAddr = ResolveAddress(arg.Dst);
+                    bool signFill = arithmetic && byteOffset == width - 1;
                     for (int i = 0; i < bitShift; i++)
                     {
-                        Emit("BCF", "STATUS", "0");
-                        SelectBank(dstAddr);
+                        if (signFill)
+                        {
+                            SelectBank(dstAddr);
+                            Emit("RLF", dstAddr, "W");
+                        }
+                        else
+                        {
+                            Emit("BCF", "STATUS", "0");
+                            SelectBank(dstAddr);
+                        }
+
                         Emit(rotateOp, dstAddr, "F");
                     }
                 }
@@ -1950,8 +2036,17 @@ public class PIC14CodeGen : CodeGen
                     Emit("BTFSC", "STATUS", "2");
                     Emit("GOTO", doneLabel);
                     EmitLabel(loopLabel);
-                    Emit("BCF", "STATUS", "0");
-                    SelectBank(dstAddr);
+                    if (arithmetic)
+                    {
+                        SelectBank(dstAddr);
+                        Emit("RLF", dstAddr, "W");
+                    }
+                    else
+                    {
+                        Emit("BCF", "STATUS", "0");
+                        SelectBank(dstAddr);
+                    }
+
                     Emit(rotateOp, dstAddr, "F");
                     SelectBank("__tmp");
                     Emit("DECFSZ", "__tmp", "F");
@@ -2294,8 +2389,17 @@ public class PIC14CodeGen : CodeGen
                     Emit("BTFSC", "STATUS", "2");
                     Emit("GOTO", doneLbl);
                     EmitLabel(loopLbl);
-                    Emit("BCF", "STATUS", "0");
-                    SelectBank(targetAddr);
+                    if (arg.Op == IrBinOp.RShift && IsSignedValue(arg.Target))
+                    {
+                        SelectBank(targetAddr);
+                        Emit("RLF", targetAddr, "W");
+                    }
+                    else
+                    {
+                        Emit("BCF", "STATUS", "0");
+                        SelectBank(targetAddr);
+                    }
+
                     Emit(rotateOp, targetAddr, "F");
                     SelectBank("__tmp");
                     Emit("DECFSZ", "__tmp", "F");
@@ -2470,9 +2574,9 @@ public class PIC14CodeGen : CodeGen
                 Emit("MOVF", "__tmp", "F");
                 Emit("BTFSC", "STATUS", "2");
                 Emit("GOTO", doneLbl);
-                Emit("BCF", "STATUS", "0");
                 if (left)
                 {
+                    Emit("BCF", "STATUS", "0");
                     SelectBank(targetAddr);
                     Emit("RLF", targetAddr, "F");
                     SelectBank(targetAddrHi);
@@ -2481,6 +2585,8 @@ public class PIC14CodeGen : CodeGen
                 else
                 {
                     SelectBank(targetAddrHi);
+                    if (IsSignedValue(arg.Target)) Emit("RLF", targetAddrHi, "W");
+                    else Emit("BCF", "STATUS", "0");
                     Emit("RRF", targetAddrHi, "F");
                     SelectBank(targetAddr);
                     Emit("RRF", targetAddr, "F");
@@ -2497,49 +2603,6 @@ public class PIC14CodeGen : CodeGen
         throw new NotSupportedException("PIC14: AugAssign size/op not fully implemented");
     }
 
-    private void EmitFloatAdd(string target, string source)
-    {
-        // Move 4 bytes of source to __FP_B
-        for (int i = 0; i < 4; i++)
-        {
-            string srcByte = i == 0
-                ? source
-                : source.StartsWith("0x")
-                    ? $"0x{ParseHexAddr(source) + i:X2}"
-                    : source + "+" + i;
-            SelectBank(srcByte);
-            Emit("MOVF", srcByte, "W");
-            Emit("MOVWF", $"__FP_B+{i}");
-        }
-
-        // Move 4 bytes of target to __FP_A
-        for (int i = 0; i < 4; i++)
-        {
-            string tgtByte = i == 0
-                ? target
-                : target.StartsWith("0x")
-                    ? $"0x{ParseHexAddr(target) + i:X2}"
-                    : target + "+" + i;
-            SelectBank(tgtByte);
-            Emit("MOVF", tgtByte, "W");
-            Emit("MOVWF", $"__FP_A+{i}");
-        }
-
-        Emit("CALL", "__add_float");
-
-        // Move 4 bytes of __FP_A back to target
-        for (int i = 0; i < 4; i++)
-        {
-            string tgtByte = i == 0
-                ? target
-                : target.StartsWith("0x")
-                    ? $"0x{ParseHexAddr(target) + i:X2}"
-                    : target + "+" + i;
-            Emit("MOVF", $"__FP_A+{i}", "W");
-            SelectBank(tgtByte);
-            Emit("MOVWF", tgtByte);
-        }
-    }
 
     private void CompileVariant(InlineAsm arg)
     {
@@ -2598,26 +2661,63 @@ public class PIC14CodeGen : CodeGen
         Emit("GOTO", arg.Target);
     }
 
+    private void EmitBiasedLoad(Val val, bool signed)
+    {
+        string addr = ResolveAddress(val);
+        SelectBank(addr);
+        Emit("MOVF", addr, "W");
+        if (signed) Emit("XORLW", "0x80");
+    }
+
+    private void EmitCompareSub(Val src1, Val src2, bool signed)
+    {
+        if (!signed)
+        {
+            LoadIntoW(src2);
+            string plain = ResolveAddress(src1);
+            SelectBank(plain);
+            Emit("SUBWF", plain, "W");
+            return;
+        }
+
+        EmitBiasedLoad(src1, true);
+        Emit("MOVWF", ScratchCmp);
+        LoadIntoW(src2);
+        Emit("XORLW", "0x80");
+        Emit("SUBWF", ScratchCmp, "W");
+    }
+
+    private static bool TryConstOperand(Val src2, bool signed, out int k)
+    {
+        k = 0;
+        if (src2 is not Constant c) return false;
+        if (signed)
+        {
+            if (c.Value < -128 || c.Value > 127) return false;
+            k = (c.Value ^ 0x80) & 0xFF;
+            return true;
+        }
+
+        if (c.Value < 0 || c.Value > 255) return false;
+        k = c.Value;
+        return true;
+    }
+
     private void CompileVariant(JumpIfLessThan arg)
     {
         // if (src1 < src2) goto target
-        if (arg.Src2 is Constant c2 && c2.Value >= 0 && c2.Value <= 255)
+        bool signed = IsSignedComparison(arg.Src1, arg.Src2);
+        if (TryConstOperand(arg.Src2, signed, out int k))
         {
-            int k = c2.Value;
-            if (k == 0) return; // Unsigned < 0 is never true
-            string src1 = ResolveAddress(arg.Src1);
-            SelectBank(src1);
-            Emit("MOVF", src1, "W");
+            if (k == 0) return;
+            EmitBiasedLoad(arg.Src1, signed);
             Emit("SUBLW", $"0x{k - 1:X2}");
             Emit("BTFSC", "STATUS", "0");
             Emit("GOTO", arg.Target);
             return;
         }
 
-        LoadIntoW(arg.Src2);
-        string s1 = ResolveAddress(arg.Src1);
-        SelectBank(s1);
-        Emit("SUBWF", s1, "W");
+        EmitCompareSub(arg.Src1, arg.Src2, signed);
         Emit("BTFSS", "STATUS", "0");
         Emit("GOTO", arg.Target);
     }
@@ -2625,12 +2725,10 @@ public class PIC14CodeGen : CodeGen
     private void CompileVariant(JumpIfLessOrEqual arg)
     {
         // if (src1 <= src2) goto target
-        if (arg.Src2 is Constant c2 && c2.Value >= 0 && c2.Value <= 255)
+        bool signed = IsSignedComparison(arg.Src1, arg.Src2);
+        if (TryConstOperand(arg.Src2, signed, out int k))
         {
-            int k = c2.Value;
-            string src1 = ResolveAddress(arg.Src1);
-            SelectBank(src1);
-            Emit("MOVF", src1, "W");
+            EmitBiasedLoad(arg.Src1, signed);
             Emit("SUBLW", $"0x{k:X2}");
             Emit("BTFSC", "STATUS", "0");
             Emit("GOTO", arg.Target);
@@ -2638,10 +2736,7 @@ public class PIC14CodeGen : CodeGen
         }
 
         // Generic: reverse operands — src2 - src1 >= 0 -> src1 <= src2
-        LoadIntoW(arg.Src1);
-        string src2Addr = ResolveAddress(arg.Src2);
-        SelectBank(src2Addr);
-        Emit("SUBWF", src2Addr, "W");
+        EmitCompareSub(arg.Src2, arg.Src1, signed);
         Emit("BTFSC", "STATUS", "0");
         Emit("GOTO", arg.Target);
     }
@@ -2649,12 +2744,10 @@ public class PIC14CodeGen : CodeGen
     private void CompileVariant(JumpIfGreaterThan arg)
     {
         // if (src1 > src2) goto target
-        if (arg.Src2 is Constant c2 && c2.Value >= 0 && c2.Value <= 255)
+        bool signed = IsSignedComparison(arg.Src1, arg.Src2);
+        if (TryConstOperand(arg.Src2, signed, out int k))
         {
-            int k = c2.Value;
-            string src1 = ResolveAddress(arg.Src1);
-            SelectBank(src1);
-            Emit("MOVF", src1, "W");
+            EmitBiasedLoad(arg.Src1, signed);
             Emit("SUBLW", $"0x{k:X2}");
             Emit("BTFSS", "STATUS", "0");
             Emit("GOTO", arg.Target);
@@ -2662,10 +2755,7 @@ public class PIC14CodeGen : CodeGen
         }
 
         // Generic: flip operands — src2 - src1 < 0 -> C=0 -> src1 > src2
-        LoadIntoW(arg.Src1);
-        string src2Addr = ResolveAddress(arg.Src2);
-        SelectBank(src2Addr);
-        Emit("SUBWF", src2Addr, "W");
+        EmitCompareSub(arg.Src2, arg.Src1, signed);
         Emit("BTFSS", "STATUS", "0");
         Emit("GOTO", arg.Target);
     }
@@ -2673,28 +2763,23 @@ public class PIC14CodeGen : CodeGen
     private void CompileVariant(JumpIfGreaterOrEqual arg)
     {
         // if (src1 >= src2) goto target
-        if (arg.Src2 is Constant c2 && c2.Value >= 0 && c2.Value <= 255)
+        bool signed = IsSignedComparison(arg.Src1, arg.Src2);
+        if (TryConstOperand(arg.Src2, signed, out int k))
         {
-            int k = c2.Value;
             if (k == 0)
             {
                 Emit("GOTO", arg.Target);
                 return;
             }
 
-            string src1 = ResolveAddress(arg.Src1);
-            SelectBank(src1);
-            Emit("MOVF", src1, "W");
+            EmitBiasedLoad(arg.Src1, signed);
             Emit("SUBLW", $"0x{k - 1:X2}");
             Emit("BTFSS", "STATUS", "0");
             Emit("GOTO", arg.Target);
             return;
         }
 
-        LoadIntoW(arg.Src2);
-        string s1 = ResolveAddress(arg.Src1);
-        SelectBank(s1);
-        Emit("SUBWF", s1, "W");
+        EmitCompareSub(arg.Src1, arg.Src2, signed);
         Emit("BTFSC", "STATUS", "0");
         Emit("GOTO", arg.Target);
     }

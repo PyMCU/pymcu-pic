@@ -68,8 +68,18 @@ public class PIC12AsmLine
 
 public static class PIC12Peephole
 {
+    /// <summary>
+    /// <c>PYMCU_NO_PEEPHOLE=1</c> hands the assembly straight through, so a miscompile
+    /// can be bisected to this file (wrong only after the peephole) versus the code
+    /// generator (already wrong before it).
+    /// </summary>
+    private static bool Bypassed =>
+        Environment.GetEnvironmentVariable("PYMCU_NO_PEEPHOLE") == "1";
+
     public static List<PIC12AsmLine> Optimize(List<PIC12AsmLine> lines)
     {
+        if (Bypassed) return new List<PIC12AsmLine>(lines);
+
         var result = new List<PIC12AsmLine>(lines);
         bool changed = true;
 
