@@ -489,7 +489,7 @@ public class PIC14CodeGenTests
     public void AddressOutsideTheChipsGprWindow_IsRejected()
     {
         var body = new List<Instruction>();
-        for (int k = 0; k < 60; ++k)
+        for (int k = 0; k < 80; ++k)
             body.Add(new Copy(new Constant(k & 0xFF), new Variable($"v{k}")));
         body.Add(new Return(new NoneVal()));
 
@@ -498,5 +498,20 @@ public class PIC14CodeGenTests
             new DeviceConfig { Chip = "pic16f84a", Arch = "pic14" }));
 
         Assert.Contains("overflows the bank-0 window", ex.Message);
+    }
+
+    [Fact]
+    public void AllocationBase_FollowsTheChipsFirstGpr()
+    {
+        var asm84 = Compile(MakeProgram("main",
+            new Copy(new Constant(1), new Variable("a")), new Return(new NoneVal())),
+            new DeviceConfig { Chip = "pic16f84a", Arch = "pic14" });
+        var asm877 = Compile(MakeProgram("main",
+            new Copy(new Constant(1), new Variable("a")), new Return(new NoneVal())),
+            new DeviceConfig { Chip = "pic16f877a", Arch = "pic14" });
+
+        // the 16F84A's SFRs end at 0x0B; every other PIC14 we support starts at 0x20
+        Assert.Contains("CBLOCK 0x0C", asm84);
+        Assert.Contains("CBLOCK 0x20", asm877);
     }
 }
