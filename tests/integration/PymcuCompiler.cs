@@ -67,9 +67,9 @@ public static class PymcuCompiler
     /// own <c>pymcu/chips/&lt;chip&gt;.py</c> for a part the stdlib does not carry.
     /// </param>
     public static string BuildSource(string mainPy, string target = "pic16f877a", int frequencyHz = 20_000_000,
-        IReadOnlyDictionary<string, string>? extraSources = null)
-        => Cache.GetOrAdd($"src:{target}:{frequencyHz}:{Sha(mainPy)}:{Sha(Flatten(extraSources))}",
-            _ => new Lazy<string>(() => CompileSource(mainPy, target, frequencyHz, extraSources))).Value;
+        IReadOnlyDictionary<string, string>? extraSources = null, string? stdlib = null)
+        => Cache.GetOrAdd($"src:{target}:{frequencyHz}:{stdlib}:{Sha(mainPy)}:{Sha(Flatten(extraSources))}",
+            _ => new Lazy<string>(() => CompileSource(mainPy, target, frequencyHz, extraSources, stdlib))).Value;
 
     private static string Sha(string s)
     {
@@ -84,9 +84,9 @@ public static class PymcuCompiler
                                        .Select(kv => kv.Key + "\0" + kv.Value));
 
     private static string CompileSource(string mainPy, string target, int frequencyHz,
-        IReadOnlyDictionary<string, string>? extraSources)
+        IReadOnlyDictionary<string, string>? extraSources, string? stdlib = null)
     {
-        var key = Sha($"{target}:{frequencyHz}:{mainPy}:{Flatten(extraSources)}");
+        var key = Sha($"{target}:{frequencyHz}:{stdlib}:{mainPy}:{Flatten(extraSources)}");
         var dir = Path.Combine(Path.GetTempPath(), "pymcu-gen", key[..16]);
         Directory.CreateDirectory(Path.Combine(dir, "src"));
         File.WriteAllText(Path.Combine(dir, "pyproject.toml"),
@@ -99,7 +99,8 @@ public static class PymcuCompiler
             $"target = \"{target}\"\n" +
             $"frequency = {frequencyHz}\n" +
             "sources = \"src\"\n" +
-            "entry = \"main.py\"\n");
+            "entry = \"main.py\"\n" +
+            (stdlib is null ? "" : $"stdlib = [\"{stdlib}\"]\n"));
         File.WriteAllText(Path.Combine(dir, "src", "main.py"), mainPy);
         if (extraSources is not null)
         {
