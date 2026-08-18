@@ -514,4 +514,44 @@ public class PIC14CodeGenTests
         Assert.Contains("CBLOCK 0x0C", asm84);
         Assert.Contains("CBLOCK 0x20", asm877);
     }
+
+    private static DeviceConfig Pic628 => new() { Chip = "pic16f628a", Arch = "pic14" };
+
+    [Fact]
+    public void WideAugAssign_WritesEveryByteWithACarryChain()
+    {
+        var prog = MakeProgram("main",
+            new AugAssign(PyMCU.IR.BinaryOp.Sub, new Variable("v", DataType.UINT32), new Variable("d", DataType.UINT32)),
+            new Return(new NoneVal()));
+        var asm = Compile(prog, Pic628);
+
+        Assert.Equal(4, asm.Split('\n').Count(l => l.Contains("SUBWF\tv")));
+        Assert.Contains("SUBWF\tv+3", asm);
+        Assert.Contains("INCFSZ", asm);
+    }
+
+    [Fact]
+    public void WideBinary_GoesThroughTheSameChain_NotTheEightBitPath()
+    {
+        var prog = MakeProgram("main",
+            new Binary(PyMCU.IR.BinaryOp.Sub, new Variable("a", DataType.UINT32), new Variable("b", DataType.UINT32), new Variable("c", DataType.UINT32)),
+            new Return(new NoneVal()));
+        var asm = Compile(prog, Pic628);
+
+        Assert.Equal(4, asm.Split('\n').Count(l => l.Contains("SUBWF\tc")));
+        Assert.Contains("MOVWF\tc+3", asm);
+    }
+
+    [Fact]
+    public void WideOperationWithNoChain_IsRejectedInsteadOfTruncated()
+    {
+        var prog = MakeProgram("main",
+            new AugAssign(PyMCU.IR.BinaryOp.BitAnd, new Variable("v", DataType.UINT32), new Constant(255)),
+            new Return(new NoneVal()));
+
+        var ex = Assert.Throws<NotSupportedException>(() => Compile(prog, Pic628));
+        Assert.Contains("4-byte value", ex.Message);
+        Assert.Contains("low byte alone", ex.Message);
+    }
+
 }

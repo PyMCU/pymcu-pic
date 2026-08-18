@@ -1957,6 +1957,22 @@ public class PIC14CodeGen : CodeGen
             }
         }
 
+        // --- Wider than 16 bits: same shape as the 16-bit path (copy, then the
+        //     compound assignment), which is where the byte chain lives. Without
+        //     this the value fell through to the 8-bit code below and only its
+        //     low byte was computed, silently.
+        if (size >= 3)
+        {
+            if (isComparison)
+                throw new NotSupportedException(
+                    $"PIC14: comparing {size}-byte values is not implemented for this backend. " +
+                    "The comparison would otherwise be decided on the low byte alone.");
+
+            CompileVariant(new Copy(arg.Src1, arg.Dst));
+            CompileVariant(new AugAssign(arg.Op, arg.Dst, arg.Src2));
+            return;
+        }
+
         // --- 8-Bit Comparisons with Optimization ---
         if (isComparison && size == 1)
         {
@@ -2475,6 +2491,60 @@ public class PIC14CodeGen : CodeGen
         Emit("GOTO", arg.Target);
     }
 
+    private string ByteOperand(string baseAddr, int index)
+    {
+        if (index == 0) return baseAddr;
+        return baseAddr.StartsWith("0x")
+            ? $"0x{ParseHexAddr(baseAddr) + index:X2}"
+            : baseAddr + "+" + index;
+    }
+
+    // Midrange has no ADDWFC/SUBWFB, so each byte carries into the next with the
+    // INCFSZ idiom: bump the operand by the incoming carry and, when that bump
+    // wraps 0xFF to 0x00, skip the add -- the carry then rides on untouched.
+    private void EmitWideAddSub(AugAssign arg, string targetAddr, int size, bool isSub)
+    {
+        int operandSize = arg.Operand is Constant ? size : GetValSize(arg.Operand);
+        string opAddr = arg.Operand is Constant ? "" : ResolveAddress(arg.Operand);
+        string scratch = GetOrAllocVariable("__aug_b");
+
+        for (int i = 0; i < size; ++i)
+        {
+            string tByte = ByteOperand(targetAddr, i);
+
+            if (arg.Operand is Constant c)
+            {
+                Emit("MOVLW", $"0x{(c.Value >> (8 * i)) & 0xFF:X2}");
+                SelectBank(scratch);
+                Emit("MOVWF", scratch);
+            }
+            else if (i < operandSize)
+            {
+                string oByte = ByteOperand(opAddr, i);
+                SelectBank(oByte);
+                Emit("MOVF", oByte, "W");
+                SelectBank(scratch);
+                Emit("MOVWF", scratch);
+            }
+            else
+            {
+                SelectBank(scratch);
+                Emit("CLRF", scratch);
+            }
+
+            SelectBank(scratch);
+            Emit("MOVF", scratch, "W");
+            if (i > 0)
+            {
+                Emit(isSub ? "BTFSS" : "BTFSC", "STATUS", "0");
+                Emit("INCFSZ", scratch, "W");
+            }
+
+            SelectBank(tByte);
+            Emit(isSub ? "SUBWF" : "ADDWF", tByte, "F");
+        }
+    }
+
     private void CompileVariant(AugAssign arg)
     {
         // target op= operand for mul/div/mod: lower onto the Binary path — the
@@ -2751,7 +2821,16 @@ public class PIC14CodeGen : CodeGen
             }
         }
 
-        throw new NotSupportedException("PIC14: AugAssign size/op not fully implemented");
+        if (size >= 3 && (arg.Op == IrBinOp.Add || arg.Op == IrBinOp.Sub))
+        {
+            EmitWideAddSub(arg, targetAddr, size, arg.Op == IrBinOp.Sub);
+            return;
+        }
+
+        throw new NotSupportedException(
+            $"PIC14: '{arg.Op}' on a {size}-byte value is not implemented for this backend. " +
+            "At this width only + and - are. The result would otherwise be computed on the low " +
+            "byte alone and the rest left as whatever the RAM held.");
     }
 
 
