@@ -151,6 +151,9 @@ class GputilsToolchain(ExternalToolchain):
             return None
 
     def is_cached(self) -> bool:
+        # The WASI module needs no download and no compilation.
+        if self._wasi_pipeline() is not None:
+            return True
         # Bundled wheel binary, then system PATH, take priority
         if self._find_wheel_gpasm() is not None:
             return True
@@ -187,6 +190,13 @@ class GputilsToolchain(ExternalToolchain):
         )
 
     def install(self) -> Path:
+        if self._wasi_pipeline() is not None:
+            self.console.print(
+                "[green]gpasm provided as a wasm32-wasip1 module by "
+                "pymcu-pic-toolchain-wasi (nothing to download)[/green]"
+            )
+            self._write_cached_version(self.METADATA["version"])
+            return Path(__file__).with_name("wasi.py")
         # Bundled wheel binary: nothing to do.
         wheel_bin = self._find_wheel_gpasm()
         if wheel_bin:
@@ -301,7 +311,41 @@ class GputilsToolchain(ExternalToolchain):
                 self.console.print(e.stderr.decode() if e.stderr else str(e))
                 raise RuntimeError(f"Failed to compile {name}.")
 
+    @staticmethod
+    def _wasi_pipeline():
+        """The wasm32-wasip1 gpasm, or None.
+
+        Consulted before the native binary: it is the implementation PyMCU
+        packages, and it emits byte-identical .hex. PYMCU_PIC_WASI=0 forces the
+        native path, which is the escape hatch and the way to compare the two.
+        """
+        if os.environ.get("PYMCU_PIC_WASI") == "0":
+            return None
+        from .wasi import pipeline  # noqa: PLC0415
+        return pipeline()
+
+    def _report_assembler_warnings(self, diagnostics: str) -> None:
+        """Surface gpasm warnings on a SUCCESSFUL assembly.
+
+        gpasm downgrades an out-of-range operand to a warning and silently
+        truncates the value, so a build that "worked" can still be wrong.
+        Message[...] lines are omitted on purpose: PIC14 emits a bank-select
+        message per instruction and they would bury the real signal.
+        """
+        warnings = [ln for ln in diagnostics.splitlines() if "Warning[" in ln]
+        if not warnings:
+            return
+        self.console.print("[yellow]Assembler warnings:[/yellow]")
+        for line in warnings:
+            self.console.print(f"[yellow]  {line.strip()}[/yellow]")
+
     def assemble(self, asm_file: Path, output_file: Optional[Path] = None) -> Path:
+        wasi = self._wasi_pipeline()
+        if wasi is not None:
+            hex_path = wasi.assemble(asm_file, output_file)
+            self._report_assembler_warnings(getattr(wasi, "last_diagnostics", ""))
+            return hex_path
+
         tool_path = self._resolve_binary()
         
         cmd = [str(tool_path), str(asm_file)]
@@ -326,7 +370,10 @@ class GputilsToolchain(ExternalToolchain):
                 pass
 
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
+            result = subprocess.run(cmd, check=True, capture_output=True)
+            self._report_assembler_warnings(
+                (result.stderr or b"").decode() + (result.stdout or b"").decode()
+            )
             return asm_file.with_suffix(".hex")
         except subprocess.CalledProcessError as e:
             err = e.stderr.decode() if e.stderr else e.stdout.decode()
