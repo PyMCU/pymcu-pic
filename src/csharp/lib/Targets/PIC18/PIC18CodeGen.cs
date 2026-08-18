@@ -507,6 +507,14 @@ public class PIC18CodeGen : CodeGen
         private void RejectRamOverflow()
         {
             if (!RamEndExclusive.TryGetValue(ChipName(), out int end)) return;
+
+            foreach (var (name, addr) in symbolTable)
+                if (addr >= end)
+                    throw new InvalidOperationException(
+                        $"PIC18CodeGen: '{name}' was placed at 0x{addr:X3}, past the end of the " +
+                        $"GPR space of {ChipName()} (0x000-0x{end - 1:X3}). That address is not " +
+                        "data memory and the write would be discarded.");
+
             if (ramHead <= end) return;
             throw new InvalidOperationException(
                 $"PIC18CodeGen: this program needs {ramHead - StackBase} bytes of data RAM but " +

@@ -484,4 +484,19 @@ public class PIC14CodeGenTests
         Assert.True(Convert.ToInt32(m.Groups[1].Value, 16) < 0x50,
             $"scratch at 0x{m.Groups[1].Value} is inside __BADRAM on the 16F84A");
     }
+
+    [Fact]
+    public void AddressOutsideTheChipsGprWindow_IsRejected()
+    {
+        var body = new List<Instruction>();
+        for (int k = 0; k < 60; ++k)
+            body.Add(new Copy(new Constant(k & 0xFF), new Variable($"v{k}")));
+        body.Add(new Return(new NoneVal()));
+
+        var ex = Assert.Throws<InvalidOperationException>(() => Compile(
+            MakeProgram("main", body.ToArray()),
+            new DeviceConfig { Chip = "pic16f84a", Arch = "pic14" }));
+
+        Assert.Contains("overflows the bank-0 window", ex.Message);
+    }
 }

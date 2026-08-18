@@ -117,8 +117,9 @@ public class PIC14MulDivArrayTests
             new Binary(IrBinaryOp.Mul, new Variable("a"), new Variable("b"), new Variable("p")));
         var asm = Compile(prog, Pic16f84a);
 
-        // 16F84A GPRs end at 0x4F (mirrored in bank 1): scratch parks at 0x48.
-        Assert.Contains("__m_a EQU 0x48", asm);
+        // 16F84A GPRs end at 0x4F and the block runs to base+9 (__ret_hi), so 0x48
+        // put its last cells at 0x50-0x51, inside __BADRAM 0x50-0x7F. Base 0x44 ends at 0x4D.
+        Assert.Contains("__m_a EQU 0x44", asm);
     }
 
     [Fact]

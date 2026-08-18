@@ -53,6 +53,7 @@ public class PIC14CodeGen : CodeGen
     private bool _needsMul8, _needsDiv8, _needsMul16, _needsDiv16, _needsArrIdxScale;
     private bool _needsSignedCmp;
     private int _scratchBase;
+    private int _gprBase = 0x20;
     private bool NeedsMulDivScratch => _needsMul8 || _needsDiv8 || _needsMul16 || _needsDiv16;
     private string ScratchA => "__m_a";   // 2 bytes: mul multiplicand / div dividend->quotient
     private string ScratchB => "__m_b";   // 2 bytes: mul multiplier / div divisor
@@ -269,7 +270,7 @@ public class PIC14CodeGen : CodeGen
             }
             else if (_stackLayout.ContainsKey(operand))
             {
-                addr = 0x20 + _stackLayout[operand]; // Assume Bank 0 area
+                addr = _gprBase + _stackLayout[operand];
             }
             else if (_symbolTable.ContainsKey(operand))
             {
@@ -284,7 +285,7 @@ public class PIC14CodeGen : CodeGen
                     string baseOp = operand.Substring(0, plusPos);
                     int offset = int.Parse(operand.Substring(plusPos + 1));
                     if (_stackLayout.ContainsKey(baseOp))
-                        addr = 0x20 + _stackLayout[baseOp] + offset;
+                        addr = _gprBase + _stackLayout[baseOp] + offset;
                     else if (_symbolTable.ContainsKey(baseOp))
                         addr = _symbolTable[baseOp] + offset;
                 }
@@ -317,7 +318,7 @@ public class PIC14CodeGen : CodeGen
     private static readonly Dictionary<string, (int Bank0End, int ScratchBase)> Bank0Map =
         new(StringComparer.OrdinalIgnoreCase)
         {
-            ["pic16f84a"] = (0x50, 0x48),
+            ["pic16f84a"] = (0x50, 0x44),
             ["pic16f877a"] = (0x80, 0x70),
             ["pic16f628a"] = (0x80, 0x70),
             ["pic16f18877"] = (0x80, 0x70),
@@ -325,6 +326,37 @@ public class PIC14CodeGen : CodeGen
 
     private static (int Bank0End, int ScratchBase) Bank0MapFor(string chip) =>
         Bank0Map.TryGetValue(chip, out var m) ? m : (0x80, 0x70);
+
+    // Valid GPR windows in bank 0, from the gputils headers. The allocator is
+    // bank-0 only, so every data address it emits has to land inside one of these;
+    // gpasm reports the rest as Warning[219] and still writes a hex.
+    private static readonly Dictionary<string, (int Lo, int Hi)> Bank0Gpr =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["pic16f84a"] = (0x0C, 0x4F),
+            ["pic16f877a"] = (0x20, 0x7F),
+            ["pic16f628a"] = (0x20, 0x7F),
+            ["pic16f18877"] = (0x20, 0x7F),
+        };
+
+    private void RejectAddressesOutsideRam(int stackStart, int stackSize)
+    {
+        if (!Bank0Gpr.TryGetValue(ChipName(), out var gpr)) return;
+
+        foreach (var (name, addr) in _symbolTable)
+            if (addr < gpr.Lo || addr > gpr.Hi)
+                throw new InvalidOperationException(
+                    $"PIC14: '{name}' was placed at 0x{addr:X2}, outside the GPR window of " +
+                    $"{ChipName()} (0x{gpr.Lo:X2}-0x{gpr.Hi:X2}). That address does not exist " +
+                    "on this chip and the write would be discarded.");
+
+        int stackEnd = stackStart + Math.Max(stackSize - 1, 0);
+        if (stackSize > 0 && (stackStart < gpr.Lo || stackEnd > gpr.Hi))
+            throw new InvalidOperationException(
+                $"PIC14: the compiled stack spans 0x{stackStart:X2}-0x{stackEnd:X2}, outside the " +
+                $"GPR window of {ChipName()} (0x{gpr.Lo:X2}-0x{gpr.Hi:X2}). Reduce locals or " +
+                "pick a chip with more RAM.");
+    }
 
     private string ChipName()
     {
@@ -441,7 +473,8 @@ public class PIC14CodeGen : CodeGen
 
         // Advance ram_head past the stack (and float workspace) to prevent
         // collisions with dynamically-allocated variables (delay counters, etc.)
-        _ramHead = 0x20 + totalSize;
+        _gprBase = Bank0Gpr.TryGetValue(ChipName(), out var gprWin) ? gprWin.Lo : 0x20;
+        _ramHead = _gprBase + totalSize;
         if (_usesFloat) _ramHead += 12; // __FP_A(4) + __FP_B(4) + __FP_C(4)
 
         // 1. Preamble FIRST (LIST, #include, errorlevel, CONFIG)
@@ -452,7 +485,7 @@ public class PIC14CodeGen : CodeGen
         if (_stackLayout.Count > 0 || _usesFloat)
         {
             EmitComment("--- Compiled Stack (Overlays) ---");
-            EmitRaw("\tCBLOCK 0x20");
+            EmitRaw($"\tCBLOCK 0x{_gprBase:X2}");
             EmitRaw($"_stack_base: {totalSize}");
             if (_usesFloat)
             {
@@ -603,9 +636,11 @@ public class PIC14CodeGen : CodeGen
             throw new InvalidOperationException(
                 $"PIC14: RAM allocation overflows the bank-0 window " +
                 $"(head=0x{_ramHead:X2}, limit=0x{ramLimit:X2}). The PIC14 backend " +
-                "allocates all variables in bank 0 starting at 0x20 " +
+                $"allocates all variables in bank 0 starting at 0x{_gprBase:X2} " +
                 "(plus the common-RAM scratch block when mul/div or arrays are used); " +
                 "reduce locals/array sizes.");
+
+        RejectAddressesOutsideRam(_gprBase, totalSize);
 
         // Peephole optimization pass
         _assembly = PIC14Peephole.Optimize(_assembly);
