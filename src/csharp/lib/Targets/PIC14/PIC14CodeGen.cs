@@ -60,6 +60,8 @@ public class PIC14CodeGen : CodeGen
     private string ScratchC => "__m_c";   // 1 byte : div bit counter
     private string ScratchIdx => "__arr_i"; // 1 byte: scaled array index (16-bit elements)
     private string ScratchCmp => "__s_cmp";
+    private string ScratchRetHi => "__ret_hi";  // 3 bytes: return value bytes 1..3
+    private bool _needsRetHi;
 
     // --- Flash tables (const[str] / const[uint8[N]]) -------------------------
     //
@@ -361,6 +363,7 @@ public class PIC14CodeGen : CodeGen
 
         // Pre-scan for floats
         _usesFloat = false;
+        _needsRetHi = false;
         foreach (var func in program.Functions)
         {
             foreach (var instr in func.Body)
@@ -650,6 +653,15 @@ public class PIC14CodeGen : CodeGen
     private static bool IsRelationalOp(IrBinOp op) =>
         op is IrBinOp.LessThan or IrBinOp.LessEqual or IrBinOp.GreaterThan or IrBinOp.GreaterEqual;
 
+    // Same convention as PIC18: byte 0 travels in W, bytes 1..3 in a fixed cell
+    // block, so every existing 8-bit return keeps its exact code.
+    private int ReturnWidthOf(Function func)
+    {
+        var declared = func.ReturnType;
+        if (declared is DataType.VOID or DataType.UNKNOWN) return 1;
+        return Math.Min(Math.Max(declared.SizeOf(), 1), 4);
+    }
+
     private void RecordSignedCmp(Val src1, Val src2)
     {
         if (IsSignedComparison(src1, src2)) _needsSignedCmp = true;
@@ -673,6 +685,12 @@ public class PIC14CodeGen : CodeGen
     // preamble and the routines are appended after the last function.
     private void ScanForSoftwareRoutines(ProgramIR program)
     {
+        // The scratch EQUs are emitted with the preamble, before any function is
+        // compiled, so a wide return has to be spotted here and not at its use.
+        foreach (var func in program.Functions)
+            if (ReturnWidthOf(func) > 1)
+                _needsRetHi = true;
+
         foreach (var func in program.Functions)
         foreach (var instr in func.Body)
         {
@@ -701,13 +719,16 @@ public class PIC14CodeGen : CodeGen
                 case JumpIfLessOrEqual jle: RecordSignedCmp(jle.Src1, jle.Src2); break;
                 case JumpIfGreaterThan jgt: RecordSignedCmp(jgt.Src1, jgt.Src2); break;
                 case JumpIfGreaterOrEqual jge: RecordSignedCmp(jge.Src1, jge.Src2); break;
+                case Call c when GetValSize(c.Dst) > 1:
+                    _needsRetHi = true;
+                    break;
             }
         }
     }
 
     private void EmitScratchSymbols()
     {
-        if (!NeedsMulDivScratch && !_needsArrIdxScale && !_needsSignedCmp) return;
+        if (!NeedsMulDivScratch && !_needsArrIdxScale && !_needsSignedCmp && !_needsRetHi) return;
 
         EmitComment("--- Common-RAM scratch (bank-independent) ---");
         if (NeedsMulDivScratch)
@@ -732,6 +753,12 @@ public class PIC14CodeGen : CodeGen
         {
             _symbolTable[ScratchCmp] = _scratchBase + 8;
             EmitRaw($"{ScratchCmp} EQU 0x{_scratchBase + 8:X2}");
+        }
+
+        if (_needsRetHi)
+        {
+            _symbolTable[ScratchRetHi] = _scratchBase + 9;
+            EmitRaw($"{ScratchRetHi} EQU 0x{_scratchBase + 9:X2}");
         }
 
         EmitRaw("");
@@ -1354,7 +1381,33 @@ public class PIC14CodeGen : CodeGen
     private void CompileVariant(Return arg)
     {
         if (arg.Value is not NoneVal)
+        {
+            int width = _funcByName.TryGetValue(_currentFunctionName, out var fn)
+                ? ReturnWidthOf(fn)
+                : GetValSize(arg.Value);
+
+            if (width > 1)
+            {
+                _needsRetHi = true;
+                string src = ResolveAddress(arg.Value);
+                for (int i = 1; i < width; ++i)
+                {
+                    if (arg.Value is Constant rc)
+                        Emit("MOVLW", $"0x{(rc.Value >> (8 * i)) & 0xFF:X2}");
+                    else
+                    {
+                        string hi = OffsetOperand(src, i);
+                        SelectBank(hi);
+                        Emit("MOVF", hi, "W");
+                    }
+
+                    Emit("MOVWF", OffsetOperand(ScratchRetHi, i - 1));
+                }
+            }
+
             LoadIntoW(arg.Value);
+        }
+
         Emit("RETURN");
         _currentBlockTerminated = true;
     }
@@ -2302,8 +2355,21 @@ public class PIC14CodeGen : CodeGen
         // Called function may change BSR; invalidate both tracking
         _currentBank = -1;
         _strategy.InvalidateBank();
-        if (arg.Dst is Variable || arg.Dst is Temporary)
-            StoreWInto(arg.Dst);
+        if (arg.Dst is not (Variable or Temporary)) return;
+
+        int retWidth = GetValSize(arg.Dst);
+        StoreWInto(arg.Dst);
+        if (retWidth <= 1) return;
+
+        _needsRetHi = true;
+        string dst = ResolveAddress(arg.Dst);
+        for (int i = 1; i < retWidth && i <= 3; ++i)
+        {
+            Emit("MOVF", OffsetOperand(ScratchRetHi, i - 1), "W");
+            string cell = OffsetOperand(dst, i);
+            SelectBank(cell);
+            Emit("MOVWF", cell);
+        }
     }
 
     private void CompileVariant(JumpIfBitSet arg)

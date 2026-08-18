@@ -553,25 +553,18 @@ public class PIC18CodeGen : CodeGen
         {
             foreach (var func in program.Functions)
             foreach (var instr in func.Body)
-                if (instr is Binary { Op: PyMCU.IR.BinaryOp.Div } tdiv
-                    && (IsFloatVal(tdiv.Src1) || IsFloatVal(tdiv.Src2) || IsFloatVal(tdiv.Dst)))
-                    throw new NotSupportedException(
-                        "PIC18CodeGen: true division ('/') needs floating-point support, which the " +
-                        "PIC18 backend does not have yet. Use '//' for integer division.");
-
-            foreach (var func in program.Functions)
-            foreach (var instr in func.Body)
             {
                 bool touchesFloat = instr switch
                 {
                     Binary b when IsRelational(b.Op) => false,
-                    Binary { Op: PyMCU.IR.BinaryOp.Add or PyMCU.IR.BinaryOp.Sub } ab
-                        when IsFloatVal(ab.Dst) => false,
+                    Binary { Op: PyMCU.IR.BinaryOp.Add or PyMCU.IR.BinaryOp.Sub
+                        or PyMCU.IR.BinaryOp.Mul or PyMCU.IR.BinaryOp.Div
+                        or PyMCU.IR.BinaryOp.FloorDiv } => false,
                     JumpIfLessThan or JumpIfLessOrEqual or JumpIfGreaterThan
                         or JumpIfGreaterOrEqual or JumpIfEqual or JumpIfNotEqual => false,
                     Binary b => IsFloatVal(b.Src1) || IsFloatVal(b.Src2) || IsFloatVal(b.Dst),
                     Unary u => IsFloatVal(u.Src) || IsFloatVal(u.Dst),
-                    Copy c => IsFloatVal(c.Src) != IsFloatVal(c.Dst),
+                    Copy => false,
                     AugAssign a => IsFloatVal(a.Target) || IsFloatVal(a.Operand),
                     Return => false,
                     Call => false,
@@ -884,8 +877,38 @@ public class PIC18CodeGen : CodeGen
             Emit("RETURN");
         }
 
+        private void CompileFloatConvert(Copy arg, bool toFloat)
+        {
+            AllocFloatScratch();
+            usesFloat = true;
+
+            for (int i = 0; i < 4; ++i)
+            {
+                LoadExtendedByteIntoW(arg.Src, i);
+                Emit("MOVWF", Cell(FloatA, i), GetAccessMode(FloatA));
+            }
+
+            Emit("CALL", toFloat ? "__fp_float" : "__fp_fix");
+
+            int dstWidth = toFloat ? 4 : WidthOf(arg.Dst);
+            for (int i = 0; i < dstWidth && i < 4; ++i)
+            {
+                Emit("MOVF", Cell(FloatA, i), "W", GetAccessMode(FloatA));
+                if (dstWidth == 1) StoreWInto(arg.Dst);
+                else StoreWIntoByte(arg.Dst, i);
+            }
+        }
+
         private void CompileCopy(Copy arg)
         {
+            bool srcFloat = IsFloatVal(arg.Src);
+            bool dstFloat = IsFloatVal(arg.Dst);
+            if (srcFloat != dstFloat && arg.Src is not FloatConstant)
+            {
+                CompileFloatConvert(arg, dstFloat);
+                return;
+            }
+
             int width = WidthOf(arg.Dst);
             if (width > 1)
             {
@@ -1239,6 +1262,22 @@ public class PIC18CodeGen : CodeGen
         {
             EmitFloatOperands(arg.Src1, arg.Src2);
             Emit("CALL", routine);
+            if (arg.Op == PyMCU.IR.BinaryOp.FloorDiv) Emit("CALL", "__fp_floor");
+
+            if (!IsFloatVal(arg.Dst))
+            {
+                Emit("CALL", "__fp_fix");
+                int narrow = WidthOf(arg.Dst);
+                for (int i = 0; i < narrow && i < 4; ++i)
+                {
+                    Emit("MOVF", Cell(FloatA, i), "W", GetAccessMode(FloatA));
+                    if (narrow == 1) StoreWInto(arg.Dst);
+                    else StoreWIntoByte(arg.Dst, i);
+                }
+
+                return;
+            }
+
             for (int i = 0; i < 4; ++i)
             {
                 Emit("MOVF", Cell(FloatA, i), "W", GetAccessMode(FloatA));
@@ -1360,9 +1399,19 @@ public class PIC18CodeGen : CodeGen
                 return;
             }
 
-            if (IsFloatVal(arg.Dst) && arg.Op is PyMCU.IR.BinaryOp.Add or PyMCU.IR.BinaryOp.Sub)
+            if ((IsFloatVal(arg.Dst) || IsFloatVal(arg.Src1) || IsFloatVal(arg.Src2))
+                && arg.Op is PyMCU.IR.BinaryOp.Add or PyMCU.IR.BinaryOp.Sub
+                    or PyMCU.IR.BinaryOp.Mul or PyMCU.IR.BinaryOp.Div
+                    or PyMCU.IR.BinaryOp.FloorDiv)
             {
-                CompileFloatArith(arg, arg.Op == PyMCU.IR.BinaryOp.Add ? "__fp_add" : "__fp_sub");
+                CompileFloatArith(arg, arg.Op switch
+                {
+                    PyMCU.IR.BinaryOp.Add => "__fp_add",
+                    PyMCU.IR.BinaryOp.Sub => "__fp_sub",
+                    PyMCU.IR.BinaryOp.Mul => "__fp_mul",
+                    _ => "__fp_div",
+
+                });
                 return;
             }
 

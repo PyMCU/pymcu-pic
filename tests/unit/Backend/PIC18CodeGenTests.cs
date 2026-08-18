@@ -957,14 +957,25 @@ public class PIC18CodeGenTests
     // ─── Floating point ───────────────────────────────────────────────────────
 
     [Fact]
-    public void TrueDivision_IsRejectedWithAnActionableMessage()
+    public void FloatToIntConversion_CallsTheSoftFloatRoutine()
     {
         var prog = MakeProgram("main",
-            new Binary(BinaryOp.Div, new Temporary("t", DataType.FLOAT), new Constant(7), new Variable("q")));
+            new Copy(new Variable("f", DataType.FLOAT), new Variable("n", DataType.INT16)));
+        var asm = Compile(prog);
 
-        var ex = Assert.Throws<NotSupportedException>(() => Compile(prog));
-        Assert.Contains("true division", ex.Message);
-        Assert.Contains("Use '//' for integer division", ex.Message);
+        Assert.Contains("CALL\t__fp_fix", asm);
+        Assert.Contains("MOVWF\tn+1", asm);
+    }
+
+    [Fact]
+    public void IntToFloatConversion_CallsTheSoftFloatRoutine()
+    {
+        var prog = MakeProgram("main",
+            new Copy(new Variable("n", DataType.INT16), new Variable("f", DataType.FLOAT)));
+        var asm = Compile(prog);
+
+        Assert.Contains("CALL\t__fp_float", asm);
+        Assert.Contains("MOVWF\tf+3", asm);
     }
 
     [Fact]
@@ -981,14 +992,40 @@ public class PIC18CodeGenTests
     }
 
     [Fact]
-    public void FloatMultiply_IsStillRejectedInsteadOfTruncating()
+    public void FloatMultiply_CallsTheSoftFloatRoutine()
     {
         var prog = MakeProgram("main",
             new Binary(BinaryOp.Mul, new Variable("a", DataType.FLOAT),
                 new Variable("b", DataType.FLOAT), new Variable("d", DataType.FLOAT)));
+        var asm = Compile(prog);
 
-        var ex = Assert.Throws<NotSupportedException>(() => Compile(prog));
-        Assert.Contains("floating-point values are not implemented", ex.Message);
+        Assert.Contains("CALL\t__fp_mul", asm);
+        Assert.Contains("MOVWF\td+3", asm);
+    }
+
+    [Fact]
+    public void FloatDivide_CallsTheSoftFloatRoutine()
+    {
+        var prog = MakeProgram("main",
+            new Binary(BinaryOp.Div, new Variable("a", DataType.FLOAT),
+                new Variable("b", DataType.FLOAT), new Variable("d", DataType.FLOAT)));
+        var asm = Compile(prog);
+
+        Assert.Contains("CALL\t__fp_div", asm);
+        Assert.Contains("MOVWF\td+3", asm);
+    }
+
+    [Fact]
+    public void TrueDivisionIntoAnInteger_DividesAsFloatThenConverts()
+    {
+        var prog = MakeProgram("main",
+            new Binary(BinaryOp.Div, new Temporary("t", DataType.FLOAT), new Constant(7),
+                new Variable("q")));
+        var asm = Compile(prog);
+
+        Assert.Contains("CALL\t__fp_div", asm);
+        Assert.Contains("CALL\t__fp_fix", asm);
+        Assert.Contains("MOVWF\tq", asm);
     }
 
     [Fact]

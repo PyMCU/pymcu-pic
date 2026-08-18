@@ -353,6 +353,58 @@ public class PIC14CodeGenTests
         Assert.Contains("Use '//' for integer division", ex.Message);
     }
 
+    // ─── Wide return ABI ──────────────────────────────────────────────────────
+
+    [Fact]
+    public void WideReturn_PassesTheHighBytesThroughTheReturnBlock()
+    {
+        var prog = new ProgramIR();
+        prog.Functions.Add(new Function
+        {
+            Name = "widen", ReturnType = DataType.UINT16,
+            Body = new List<Instruction> { new Return(new Variable("widen.r", DataType.UINT16)) },
+        });
+        prog.Functions.Add(new Function
+        {
+            Name = "main",
+            Body = new List<Instruction>
+            {
+                new Call("widen", new List<Val>(), new Variable("main.w", DataType.UINT16)),
+                new Return(new NoneVal()),
+            },
+        });
+        var asm = Compile(prog, Pic16f877a);
+
+        Assert.Contains("__ret_hi EQU", asm);
+        Assert.Contains("MOVWF\t__ret_hi", asm);
+        Assert.Contains("MOVF\t__ret_hi, W", asm);
+        Assert.Contains("MOVWF\tmain.w+1", asm);
+    }
+
+    [Fact]
+    public void NarrowReturn_KeepsTheEightBitConvention()
+    {
+        var prog = new ProgramIR();
+        prog.Functions.Add(new Function
+        {
+            Name = "narrow", ReturnType = DataType.UINT8,
+            Body = new List<Instruction> { new Return(new Variable("narrow.r")) },
+        });
+        prog.Functions.Add(new Function
+        {
+            Name = "main",
+            Body = new List<Instruction>
+            {
+                new Call("narrow", new List<Val>(), new Variable("main.v")),
+                new Return(new NoneVal()),
+            },
+        });
+        var asm = Compile(prog, Pic16f877a);
+
+        Assert.DoesNotContain("__ret_hi", asm);
+        Assert.Contains("MOVWF\tmain.v", asm);
+    }
+
     private static int CountOf(string haystack, string needle)
     {
         int count = 0;

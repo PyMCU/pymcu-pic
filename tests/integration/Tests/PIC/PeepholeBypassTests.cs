@@ -42,4 +42,29 @@ public class PeepholeBypassTests
 
         lst.Should().NotContain("Error[");
     }
+
+    private const string Pic14Program = """
+        from pymcu.types import uint8
+        from pymcu.chips.pic16f877a import PORTB, TRISB, PORTA
+
+
+        def main():
+            TRISB.value = 0x00
+            x: uint8 = PORTA.value
+            x = x
+            PORTB.value = x
+        """;
+
+    [Test]
+    public void NoPeephole_ReachesThePic14BackendToo()
+    {
+        var optimized = PymcuCompiler.BuildSourceAsm(Pic14Program, target: "pic16f877a",
+            frequencyHz: 20_000_000);
+        var raw = PymcuCompiler.BuildSourceAsm(Pic14Program, target: "pic16f877a",
+            frequencyHz: 20_000_000, noPeephole: true);
+
+        raw.Length.Should().BeGreaterThan(optimized.Length,
+            "the PIC14 peephole does real work (bit-op coalescing, dead labels, bank " +
+            "tracking), so bypassing it must leave a visibly larger image");
+    }
 }
