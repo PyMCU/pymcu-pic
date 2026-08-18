@@ -32,6 +32,8 @@ public class PIC18CodeGen : CodeGen
         private const int LowPriorityVector = 0x0018;
         private const int StartStubAddr = 0x0020;
 
+        private int bssSize;
+
         private Function? interruptHandler;
         private Function? currentFunction;
         private int accessScratchHead;
@@ -549,32 +551,35 @@ public class PIC18CodeGen : CodeGen
 
         private static bool IsFloatVal(Val v) => v is FloatConstant || GetValType(v) == DataType.FLOAT;
 
+        private static string? FloatGapReason(Instruction instr) => instr switch
+        {
+            Binary b when IsRelational(b.Op) => null,
+            Binary { Op: PyMCU.IR.BinaryOp.Add or PyMCU.IR.BinaryOp.Sub
+                or PyMCU.IR.BinaryOp.Mul or PyMCU.IR.BinaryOp.Div
+                or PyMCU.IR.BinaryOp.FloorDiv } => null,
+            JumpIfLessThan or JumpIfLessOrEqual or JumpIfGreaterThan
+                or JumpIfGreaterOrEqual or JumpIfEqual or JumpIfNotEqual => null,
+            Binary b when IsFloatVal(b.Src1) || IsFloatVal(b.Src2) || IsFloatVal(b.Dst) =>
+                $"the '{b.Op}' operator has no floating-point form",
+            Unary u when u.Op != PyMCU.IR.UnaryOp.Neg
+                && (IsFloatVal(u.Src) || IsFloatVal(u.Dst)) =>
+                $"the unary '{u.Op}' operator has no floating-point form",
+            AugAssign a when IsFloatVal(a.Target) || IsFloatVal(a.Operand) =>
+                "augmented assignment on a floating-point value has no lowering",
+            _ => null,
+        };
+
         private static void RejectFloats(ProgramIR program)
         {
             foreach (var func in program.Functions)
             foreach (var instr in func.Body)
             {
-                bool touchesFloat = instr switch
-                {
-                    Binary b when IsRelational(b.Op) => false,
-                    Binary { Op: PyMCU.IR.BinaryOp.Add or PyMCU.IR.BinaryOp.Sub
-                        or PyMCU.IR.BinaryOp.Mul or PyMCU.IR.BinaryOp.Div
-                        or PyMCU.IR.BinaryOp.FloorDiv } => false,
-                    JumpIfLessThan or JumpIfLessOrEqual or JumpIfGreaterThan
-                        or JumpIfGreaterOrEqual or JumpIfEqual or JumpIfNotEqual => false,
-                    Binary b => IsFloatVal(b.Src1) || IsFloatVal(b.Src2) || IsFloatVal(b.Dst),
-                    Unary u => IsFloatVal(u.Src) || IsFloatVal(u.Dst),
-                    Copy => false,
-                    AugAssign a => IsFloatVal(a.Target) || IsFloatVal(a.Operand),
-                    Return => false,
-                    Call => false,
-                    _ => false,
-                };
-
-                if (touchesFloat)
+                string? reason = FloatGapReason(instr);
+                if (reason is not null)
                     throw new NotSupportedException(
-                        "PIC18CodeGen: floating-point values are not implemented yet for the PIC18 " +
-                        "backend. The value would otherwise be truncated to an integer silently.");
+                        $"PIC18CodeGen: {reason} on this backend. Floating-point arithmetic, " +
+                        "comparison, negation and conversion are implemented; only this case " +
+                        "would be truncated to an integer silently.");
             }
         }
 
@@ -612,6 +617,8 @@ public class PIC18CodeGen : CodeGen
             backendScratchBlocks.Clear();
             functionRanges.Clear();
             needsErrTrap = false;
+            bssSize = program.Globals.Sum(g => g.Type.SizeOf()) + program.GlobalArrays.Values.Sum();
+
             interruptHandler = null;
             foreach (var func in program.Functions)
             {
@@ -652,6 +659,7 @@ public class PIC18CodeGen : CodeGen
             EmitConfigDirectives();
 
             EmitRaw($"_stack_base EQU 0x{StackBase:X3}");
+            if (bssSize > 0) EmitRaw($"_bss_end EQU _stack_base + 0x{bssSize:X3}");
             foreach (var (name, offset) in stackLayout)
                 EmitRaw($"{name} EQU _stack_base + 0x{offset:X3}");
 
@@ -691,11 +699,38 @@ public class PIC18CodeGen : CodeGen
             output.WriteLine("\tEND");
         }
 
+        // Same contract as the AVR backend: zero the globals region on entry to
+        // main, before the IR's own initializer stores run. Globals with an
+        // initializer arrive as ordinary Copy instructions; the ones without were
+        // reading whatever the RAM powered up with.
+        private void EmitBssClear()
+        {
+            if (bssSize <= 0) return;
+
+            string loop = MakeLabel("bss_loop");
+            string body = MakeLabel("bss_body");
+            string done = MakeLabel("bss_done");
+
+            Emit("LFSR", "0", "_stack_base");
+            EmitLabel(loop);
+            Emit("MOVLW", "LOW(_bss_end)");
+            Emit("XORWF", "FSR0L", "W", "ACCESS");
+            Emit("BNZ", body);
+            Emit("MOVLW", "HIGH(_bss_end)");
+            Emit("XORWF", "FSR0H", "W", "ACCESS");
+            Emit("BZ", done);
+            EmitLabel(body);
+            Emit("CLRF", "POSTINC0", "ACCESS");
+            Emit("BRA", loop);
+            EmitLabel(done);
+        }
+
         private void CompileFunction(Function func)
         {
             currentFunction = func;
             int start = assembly.Count;
             EmitLabel(func.Name);
+            if (func.Name == "main") EmitBssClear();
             foreach (var instr in func.Body)
                 CompileInstruction(instr);
 
@@ -810,7 +845,7 @@ public class PIC18CodeGen : CodeGen
                 case SignalSuccess: CompileSignalSuccess(); break;
                 case BranchOnError arg: CompileBranchOnError(arg); break;
                 case InlineAsm arg: assembly.Add(PIC18AsmLine.MakeRaw(arg.Code)); break;
-                case Bitcast arg: CompileCopy(new Copy(arg.Src, arg.Dst)); break;
+                case Bitcast arg: CompileBitcast(arg); break;
                 case InlineExpansionMarker:
                 case GcRoot:
                 case GcUnroot:
@@ -899,6 +934,18 @@ public class PIC18CodeGen : CodeGen
             }
         }
 
+        private void CompileBitcast(Bitcast bc)
+        {
+            int dstWidth = WidthOf(bc.Dst);
+            int srcWidth = WidthOf(bc.Src);
+            for (int i = 0; i < dstWidth; ++i)
+            {
+                if (i < srcWidth) LoadExtendedByteIntoW(bc.Src, i);
+                else Emit("MOVLW", "0x00");
+                StoreWIntoByte(bc.Dst, i);
+            }
+        }
+
         private void CompileCopy(Copy arg)
         {
             bool srcFloat = IsFloatVal(arg.Src);
@@ -934,8 +981,47 @@ public class PIC18CodeGen : CodeGen
             }
         }
 
+        private void CompileFloatUnary(Unary arg)
+        {
+            if (IsFloatVal(arg.Dst))
+            {
+                for (int i = 0; i < 4; ++i)
+                {
+                    LoadExtendedByteIntoW(arg.Src, i);
+                    if (i == 3) Emit("XORLW", "0x80");
+                    StoreWIntoByte(arg.Dst, i);
+                }
+
+                return;
+            }
+
+            AllocFloatScratch();
+            usesFloat = true;
+            for (int i = 0; i < 4; ++i)
+            {
+                LoadExtendedByteIntoW(arg.Src, i);
+                if (i == 3) Emit("XORLW", "0x80");
+                Emit("MOVWF", Cell(FloatA, i), GetAccessMode(FloatA));
+            }
+
+            Emit("CALL", "__fp_fix");
+            int dstWidth = WidthOf(arg.Dst);
+            for (int i = 0; i < dstWidth && i < 4; ++i)
+            {
+                Emit("MOVF", Cell(FloatA, i), "W", GetAccessMode(FloatA));
+                if (dstWidth == 1) StoreWInto(arg.Dst);
+                else StoreWIntoByte(arg.Dst, i);
+            }
+        }
+
         private void CompileUnary(Unary arg)
         {
+            if (arg.Op == PyMCU.IR.UnaryOp.Neg && (IsFloatVal(arg.Src) || IsFloatVal(arg.Dst)))
+            {
+                CompileFloatUnary(arg);
+                return;
+            }
+
             LoadIntoW(arg.Src);
             switch (arg.Op)
             {

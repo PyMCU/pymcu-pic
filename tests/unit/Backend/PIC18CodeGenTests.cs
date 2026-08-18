@@ -1043,6 +1043,120 @@ public class PIC18CodeGenTests
     }
 
     [Fact]
+    public void FloatNegation_FlipsTheSignBitInsteadOfBeingRejected()
+    {
+        var prog = MakeProgram("main",
+            new Unary(UnaryOp.Neg, new Variable("f", DataType.FLOAT),
+                new Variable("d", DataType.FLOAT)));
+        var asm = Compile(prog);
+
+        Assert.Contains("XORLW\t0x80", asm);
+        Assert.Contains("MOVWF\td+3", asm);
+        Assert.DoesNotContain("CALL", asm);
+    }
+
+    [Fact]
+    public void NegatedFloatLiteral_KeepsItsMagnitudeBits()
+    {
+        var prog = MakeProgram("main",
+            new Unary(UnaryOp.Neg, new FloatConstant(3.7),
+                new Variable("d", DataType.FLOAT)));
+        var asm = Compile(prog);
+
+        // 3.7f == 0x406CCCCD; the flip belongs to the top byte alone
+        Assert.Contains("MOVLW\t0xCD", asm);
+        Assert.Contains("MOVLW\t0x6C", asm);
+        Assert.Contains("MOVLW\t0x40", asm);
+        Assert.Contains("XORLW\t0x80", asm);
+        Assert.Contains("MOVWF\td+3", asm);
+    }
+
+    [Fact]
+    public void FloatNegationIntoAnInteger_FlipsTheSignThenConverts()
+    {
+        var prog = MakeProgram("main",
+            new Unary(UnaryOp.Neg, new Variable("f", DataType.FLOAT),
+                new Variable("n", DataType.INT16)));
+        var asm = Compile(prog);
+
+        var flip = asm.IndexOf("XORLW\t0x80", StringComparison.Ordinal);
+        var fix = asm.IndexOf("CALL\t__fp_fix", StringComparison.Ordinal);
+        Assert.True(flip >= 0 && fix > flip, "the sign flip must happen before the conversion");
+        Assert.Contains("MOVWF\tn+1", asm);
+    }
+
+    [Fact]
+    public void UnsupportedFloatUnary_NamesTheOperatorInsteadOfBlamingFloatSupport()
+    {
+        var prog = MakeProgram("main",
+            new Unary(UnaryOp.BitNot, new Variable("f", DataType.FLOAT),
+                new Variable("d", DataType.FLOAT)));
+
+        var ex = Assert.Throws<NotSupportedException>(() => Compile(prog));
+        Assert.Contains("unary 'BitNot'", ex.Message);
+        Assert.DoesNotContain("floating-point values are not implemented", ex.Message);
+    }
+
+    [Fact]
+    public void BitcastFromFloat_ReinterpretsTheBytesInsteadOfConverting()
+    {
+        var prog = MakeProgram("main",
+            new Bitcast(new Variable("f", DataType.FLOAT), new Variable("u", DataType.UINT32)));
+        var asm = Compile(prog);
+
+        Assert.DoesNotContain("__fp_fix", asm);
+        Assert.DoesNotContain("CALL", asm);
+        Assert.Contains("MOVF\tf, W", asm);
+        Assert.Contains("MOVWF\tu", asm);
+        Assert.Contains("MOVF\tf+3, W", asm);
+        Assert.Contains("MOVWF\tu+3", asm);
+    }
+
+    [Fact]
+    public void BitcastToFloat_ReinterpretsTheBytesInsteadOfConverting()
+    {
+        var prog = MakeProgram("main",
+            new Bitcast(new Variable("u", DataType.UINT32), new Variable("f", DataType.FLOAT)));
+        var asm = Compile(prog);
+
+        Assert.DoesNotContain("__fp_float", asm);
+        Assert.DoesNotContain("CALL", asm);
+        Assert.Contains("MOVF\tu+3, W", asm);
+        Assert.Contains("MOVWF\tf+3", asm);
+    }
+
+    [Fact]
+    public void BitcastOfAFloatLiteral_EmitsItsIeeeBitPattern()
+    {
+        var prog = MakeProgram("main",
+            new Bitcast(new FloatConstant(1.0), new Variable("u", DataType.UINT32)));
+        var asm = Compile(prog);
+
+        // 1.0f == 0x3F800000
+        Assert.Contains("MOVLW\t0x00", asm);
+        Assert.Contains("MOVLW\t0x80", asm);
+        Assert.Contains("MOVLW\t0x3F", asm);
+        Assert.Contains("MOVWF\tu+3", asm);
+        Assert.DoesNotContain("CALL", asm);
+    }
+
+    [Fact]
+    public void BitcastAlongsideFloatArithmetic_AddsNoConversionCall()
+    {
+        var prog = MakeProgram("main",
+            new Binary(BinaryOp.Add, new Variable("a", DataType.FLOAT),
+                new Variable("b", DataType.FLOAT), new Variable("f", DataType.FLOAT)),
+            new Bitcast(new Variable("f", DataType.FLOAT), new Variable("u", DataType.UINT32)));
+        var asm = Compile(prog);
+
+        var calls = asm.Split('\n')
+            .Where(l => l.Contains("CALL\t"))
+            .Select(l => l.Trim())
+            .ToList();
+        Assert.Equal(new[] { "CALL\t__fp_add" }, calls);
+    }
+
+    [Fact]
     public void FloatComparison_CallsTheSoftFloatRoutine()
     {
         var prog = MakeProgram("main",
@@ -1413,6 +1527,61 @@ public class PIC18CodeGenTests
         var ex = Assert.Throws<NotSupportedException>(() => Compile(prog));
         Assert.Contains("unhandled IR instruction", ex.Message);
         Assert.Contains("GcAlloc", ex.Message);
+    }
+
+    // ─── Startup: globals region ──────────────────────────────────────────────
+
+    [Fact]
+    public void Globals_AreZeroedBeforeMainRuns()
+    {
+        var prog = new ProgramIR();
+        prog.Globals.Add(new Variable("g8", DataType.UINT8));
+        prog.Globals.Add(new Variable("g16", DataType.UINT16));
+        prog.Functions.Add(new Function
+        {
+            Name = "main",
+            Body = new List<Instruction>
+            {
+                new Copy(new Constant(1), new Variable("g8", DataType.UINT8)),
+                new Return(new NoneVal()),
+            },
+        });
+        var asm = Compile(prog);
+
+        Assert.Contains("_bss_end EQU _stack_base + 0x003", asm);
+        Assert.Contains("LFSR\t0, _stack_base", asm);
+        Assert.Contains("CLRF\tPOSTINC0", asm);
+        Assert.True(asm.IndexOf("LFSR\t0, _stack_base", StringComparison.Ordinal)
+                    < asm.IndexOf("MOVWF\tg8", StringComparison.Ordinal),
+            "the clear must run before the IR's own initializer stores");
+    }
+
+    [Fact]
+    public void GlobalArrays_CountTowardTheClearedRegion()
+    {
+        var prog = new ProgramIR();
+        prog.Globals.Add(new Variable("g8", DataType.UINT8));
+        prog.GlobalArrays["buf"] = 6;
+        prog.Functions.Add(new Function
+        {
+            Name = "main",
+            Body = new List<Instruction> { new Return(new NoneVal()) },
+        });
+        var asm = Compile(prog);
+
+        Assert.Contains("_bss_end EQU _stack_base + 0x007", asm);
+        Assert.Contains("CLRF\tPOSTINC0", asm);
+        Assert.Contains("MOVLW\tHIGH(_bss_end)", asm);
+    }
+
+    [Fact]
+    public void WithoutGlobals_NoClearIsEmitted()
+    {
+        var prog = MakeProgram("main", new Return(new NoneVal()));
+        var asm = Compile(prog);
+
+        Assert.DoesNotContain("_bss_end", asm);
+        Assert.DoesNotContain("CLRF\tPOSTINC0", asm);
     }
 
     private static int CountOf(string haystack, string needle)
