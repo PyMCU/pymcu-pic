@@ -750,6 +750,12 @@ public class PIC18CodeGen : CodeGen
 
             // Run peephole
             var optimized = PIC18Peephole.Optimize(assembly);
+
+            // Then choose BRA against GOTO by distance. After the peephole, because it adds and
+            // removes instructions and a distance measured before it is measured on code that
+            // is not what gets assembled.
+            PIC18BranchRelax.Apply(optimized);
+
             foreach (var line in optimized)
                 output.WriteLine(line.ToString());
 
