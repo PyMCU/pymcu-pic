@@ -437,6 +437,19 @@ public class PIC18CodeGen : CodeGen
                 RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private int asmRunCounter;
 
+        // One expansion of an `asm()` block is one run, and the labels it defines are renamed
+        // so a body inlined twice does not define the same label twice.
+        //
+        // A run used to mean ADJACENT InlineAsm instructions. Since PyMCU 0ea529e4 a DebugLine
+        // sits between every `asm()` of an inlined body, so every run held exactly one
+        // instruction: `_dly_i16m18:` was renamed inside its own run and the `BRA _dly_i16m18`
+        // in the next run kept the old name. gpasm: Error[113] Symbol not previously defined.
+        // The whole PIC corpus stopped assembling, `blink` on every chip of all three families.
+        //
+        // A DebugLine emits a comment and no code, so it cannot separate two halves of one asm
+        // block. Anything that emits code can, and still ends the run.
+        private static bool IsCodeless(Instruction instr) => instr is DebugLine;
+
         private List<Instruction> UniquifyInlineAsmLabels(List<Instruction> body)
         {
             var result = new List<Instruction>(body.Count);
@@ -445,26 +458,36 @@ public class PIC18CodeGen : CodeGen
             {
                 if (body[i] is not InlineAsm) { result.Add(body[i]); i++; continue; }
 
+                // `end` is one past the LAST InlineAsm of the run, so codeless instructions
+                // trailing the block are left to the outer loop rather than swallowed here.
                 int start = i;
-                while (i < body.Count && body[i] is InlineAsm) i++;
+                int end = i + 1;
+                for (int j = i; j < body.Count; j++)
+                {
+                    if (body[j] is InlineAsm) { end = j + 1; continue; }
+                    if (IsCodeless(body[j])) continue;
+                    break;
+                }
 
                 var renames = new Dictionary<string, string>();
-                for (int j = start; j < i; j++)
+                for (int j = start; j < end; j++)
                 {
-                    var m = AsmLabelDef.Match(((InlineAsm)body[j]).Code);
+                    if (body[j] is not InlineAsm ia) continue;
+                    var m = AsmLabelDef.Match(ia.Code);
                     if (m.Success && !renames.ContainsKey(m.Groups[1].Value))
                         renames[m.Groups[1].Value] = $"{m.Groups[1].Value}_{asmRunCounter}";
                 }
                 if (renames.Count > 0) asmRunCounter++;
 
-                for (int j = start; j < i; j++)
+                for (int j = start; j < end; j++)
                 {
-                    var ia = (InlineAsm)body[j];
+                    if (body[j] is not InlineAsm ia) { result.Add(body[j]); continue; }
                     var code = ia.Code;
                     foreach (var (oldName, newName) in renames)
                         code = Regex.Replace(code, $@"\b{Regex.Escape(oldName)}\b", newName);
                     result.Add(code == ia.Code ? ia : ia with { Code = code });
                 }
+                i = end;
             }
             return result;
         }
