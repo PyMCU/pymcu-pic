@@ -350,8 +350,50 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
                 throw new NotSupportedException(
                     "PIC12CodeGen: ArrayStore (array element assignment) is not implemented for the PIC12 baseline backend. " +
                     "The instruction was previously ignored silently, producing wrong code.");
+
+            // Carry no code by design, exactly as PIC18 treats them. An expansion marker is
+            // metadata for the outliner, and the GC roots are bookkeeping for a collector this
+            // backend does not have. They must stay ABOVE the default: a blanket refusal here
+            // would reject every program containing an inline expansion, which is most of them.
+            case InlineExpansionMarker:
+            case GcRoot:
+            case GcUnroot:
+                break;
+
+            // Everything else. Without this arm the instruction was dropped and the program
+            // shipped doing part of what was written; there were fourteen such instructions,
+            // and the 10F200 assembles real firmware again, so what falls reaches a chip.
+            default:
+                throw new NotSupportedException(PIC12Unsupported(instr));
         }
     }
+
+    /// <summary>
+    /// Why an instruction has no PIC12 lowering, in the two kinds a reader can act on
+    /// differently: one says the part cannot do it, the other says nobody has written it yet.
+    /// </summary>
+    private static string PIC12Unsupported(Instruction instr) => instr switch
+    {
+        // The baseline has no FSR/INDF pair, which is the same reason LoadIndirect and
+        // StoreIndirect refuse above. Nothing that has to reach memory through a computed
+        // address can be lowered here, whoever writes it.
+        BytearrayLoad or BytearrayStore or FlashLoadPtr =>
+            $"PIC12: {instr.GetType().Name} is not supported on the PIC12 baseline: it needs an "
+            + "indirect-addressing register, and this part has none. Index with compile-time "
+            + "constants, or pick a PIC14 part.",
+
+        // A collector needs a heap, and the baseline parts have 16 to 96 bytes of RAM in total.
+        GcAlloc or GcRoot or GcUnroot =>
+            $"PIC12: {instr.GetType().Name} is not supported on the PIC12 baseline: it belongs to "
+            + "the garbage collector, and a part with tens of bytes of RAM has no heap to collect. "
+            + "Use fixed-size storage.",
+
+        // The rest could be lowered and have not been. Different sentence on purpose: this one
+        // is a gap in the backend, not a limit of the silicon.
+        _ => $"PIC12: {instr.GetType().Name} is not implemented for the PIC12 baseline backend. "
+             + "It was previously dropped without a word, which compiled a program that did not "
+             + "do what it said.",
+    };
 
     private void CompileReturn(Return arg)
     {
