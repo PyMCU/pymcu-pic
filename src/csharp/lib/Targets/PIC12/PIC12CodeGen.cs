@@ -433,8 +433,43 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
         StoreWInto(arg.Dst);
     }
 
+    /// <summary>
+    /// The binary operators this backend lowers. Checked BEFORE anything is emitted, which is
+    /// the whole point: the operand load and the destination store live outside the switch
+    /// below, so an operator that fell through it wrote Src1 into Dst and then left a malformed
+    /// instruction behind. `GPIO.value = a * b` emitted
+    ///
+    ///     MOVF   main.a, W
+    ///     MOVWF  0x06          the wrong value, already stored
+    ///     MOVF                 no operand
+    ///
+    /// and the build failed only because gpasm rejects that last line. That is an accident of
+    /// the emitter, not a guard: anything that made the fallthrough emit nothing, or emit
+    /// something syntactically valid, would have turned it into a silent wrong answer.
+    ///
+    /// The list is the SUPPORTED set rather than the unsupported one on purpose. Adding an
+    /// operator to the switch and forgetting this list gives a refusal for something that
+    /// works, which is loud and gets fixed; listing the unsupported ones instead would let a
+    /// newly added IR operator fall straight back through into silence.
+    /// </summary>
+    private static bool CanLowerBinary(PyMCU.IR.BinaryOp op) => op is
+        PyMCU.IR.BinaryOp.Add or PyMCU.IR.BinaryOp.Sub
+        or PyMCU.IR.BinaryOp.BitAnd or PyMCU.IR.BinaryOp.BitOr or PyMCU.IR.BinaryOp.BitXor
+        or PyMCU.IR.BinaryOp.LShift or PyMCU.IR.BinaryOp.RShift
+        or PyMCU.IR.BinaryOp.Equal or PyMCU.IR.BinaryOp.NotEqual
+        or PyMCU.IR.BinaryOp.LessThan or PyMCU.IR.BinaryOp.LessEqual
+        or PyMCU.IR.BinaryOp.GreaterThan or PyMCU.IR.BinaryOp.GreaterEqual;
+
     private void CompileBinary(Binary arg)
     {
+        if (!CanLowerBinary(arg.Op))
+            throw new NotSupportedException(
+                $"PIC12: the '{arg.Op}' operator is not implemented for the PIC12 baseline "
+                + "backend. The baseline core has no multiply, and division and modulo need a "
+                + "software routine nobody has written for it yet; PIC14 and PIC18 have all "
+                + "four. Keep the arithmetic to add, subtract, shift and the bitwise operators, "
+                + "or pick a PIC14 part.");
+
         LoadIntoW(arg.Src1);
         string right = ResolveAddress(arg.Src2);
 
