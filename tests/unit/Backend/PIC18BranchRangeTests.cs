@@ -52,6 +52,9 @@ public class PIC18BranchRangeTests
 
     private static bool IsTwoWord(string m) => m is "GOTO" or "CALL" or "MOVFF" or "LFSR";
 
+    private static readonly HashSet<string> Conditional =
+        new() { "BZ", "BNZ", "BC", "BNC", "BN", "BNN", "BOV", "BNOV" };
+
     /// <summary>
     /// Walks the emitted text the way the assembler does. Returns every BRA that cannot reach
     /// its label, and every jump naming a label the output does not define. Counting words here
@@ -61,7 +64,7 @@ public class PIC18BranchRangeTests
     private static List<string> Unreachable(string asm, out int instructions)
     {
         var labelAt = new Dictionary<string, int>();
-        var branches = new List<(string Label, int At, bool Short)>();
+        var branches = new List<(string Label, int At, string Mnemonic)>();
         instructions = 0;
 
         int at = 0;
@@ -79,19 +82,24 @@ public class PIC18BranchRangeTests
             if (mnemonic is "LIST" or "CONFIG" or "END" or "#INCLUDE" or "ORG" or "EQU") continue;
 
             instructions++;
-            if (mnemonic is "BRA" or "GOTO" && parts.Length > 1)
-                branches.Add((parts[1].Split(',')[0].Trim(), at, mnemonic == "BRA"));
+            if (parts.Length > 1 && (mnemonic is "BRA" or "GOTO" || Conditional.Contains(mnemonic)))
+                branches.Add((parts[1].Split(',')[0].Trim(), at, mnemonic));
 
             at += IsTwoWord(mnemonic) ? 2 : 1;
         }
 
         var bad = new List<string>();
-        foreach (var (label, branchAt, isShort) in branches)
+        foreach (var (label, branchAt, mnemonic) in branches)
         {
             if (!labelAt.TryGetValue(label, out int target)) { bad.Add($"{label}:undefined"); continue; }
-            if (!isShort) continue;
+            if (mnemonic == "GOTO") continue;                       // absolute, always reaches
             int delta = target - (branchAt + 1);
-            if (delta < -1024 || delta > 1023) bad.Add($"{label}:{delta}");
+            // BRA carries 11 signed bits; the conditional branches carry 8, a window eight
+            // times narrower. Checking them with BRA's numbers would pass a BZ that gpasm
+            // rejects, which is the whole defect one level down.
+            int lo = mnemonic == "BRA" ? -1024 : -128;
+            int hi = mnemonic == "BRA" ? 1023 : 127;
+            if (delta < lo || delta > hi) bad.Add($"{mnemonic} {label}:{delta}");
         }
         return bad;
     }
@@ -169,6 +177,55 @@ public class PIC18BranchRangeTests
         });
 
         Assert.Contains("BRA\tL_near", asm);
+        Assert.DoesNotContain("GOTO\tL_near", asm);
+    }
+
+    // ─── the conditional branches, eight times narrower ───────────────────
+
+    // `if x:` over a body of more than about 128 words already failed to assemble with the same
+    // Error[126] as the unconditional case, from a BZ rather than a BRA. Reachable from ordinary
+    // Python, not latent. The body falls through when the test is false, so it is not deleted.
+    [Fact]
+    public void AConditionalBranchOverALongBody_CanReachItsLabel()
+    {
+        var body = new List<Instruction> { new JumpIfZero(new Variable("x"), "L_far") };
+        body.AddRange(Pad(Filler));
+        body.Add(new Label("L_far"));
+        body.Add(new Return(new NoneVal()));
+
+        AssertEveryBranchReaches(Compile(body));
+    }
+
+    // There is no long conditional branch on this part, so a far one becomes the OPPOSITE test
+    // hopping over a GOTO. The condition has to survive that inversion, which is what this pins:
+    // the branch that remains tests the opposite of the one written.
+    [Fact]
+    public void AFarConditional_BecomesItsInverseHoppingOverAGoto()
+    {
+        var body = new List<Instruction> { new JumpIfZero(new Variable("x"), "L_far") };
+        body.AddRange(Pad(Filler));
+        body.Add(new Label("L_far"));
+        body.Add(new Return(new NoneVal()));
+
+        var asm = Compile(body);
+
+        Assert.Contains("BNZ", asm);            // the inverse test
+        Assert.Contains("GOTO\tL_far", asm);    // and the long jump it hops over
+    }
+
+    // The other way to be wrong, again: widening every conditional would satisfy the two above
+    // and cost two words on each one. A near conditional keeps its single-word form.
+    [Fact]
+    public void ANearConditional_StaysTheOneWordForm()
+    {
+        var body = new List<Instruction> { new JumpIfZero(new Variable("x"), "L_near") };
+        body.AddRange(Pad(4));
+        body.Add(new Label("L_near"));
+        body.Add(new Return(new NoneVal()));
+
+        var asm = Compile(body);
+
+        Assert.Contains("BZ\tL_near", asm);
         Assert.DoesNotContain("GOTO\tL_near", asm);
     }
 }
