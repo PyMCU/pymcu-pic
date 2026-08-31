@@ -18,6 +18,22 @@ public static class PIC18BranchRelax
     private const int BraMin = -1024;
     private const int BraMax = 1023;
 
+    // The conditional relative branches take an 8-bit signed word offset, so their window is
+    // eight times narrower than BRA's. `if x:` over a body of more than about 128 words already
+    // fails to assemble with the same Error[126]; this is not a latent case.
+    private const int CondMin = -128;
+    private const int CondMax = 127;
+
+    // Each conditional branch and the one that tests the opposite condition. A branch too far to
+    // reach its label is rewritten as its inverse hopping over a GOTO, which needs the pair.
+    private static readonly Dictionary<string, string> Inverse = new()
+    {
+        ["BZ"] = "BNZ", ["BNZ"] = "BZ",
+        ["BC"] = "BNC", ["BNC"] = "BC",
+        ["BN"] = "BNN", ["BNN"] = "BN",
+        ["BOV"] = "BNOV", ["BNOV"] = "BOV",
+    };
+
     // The two-word instructions. Everything else this backend emits is one word.
     private static bool IsTwoWord(string mnemonic) =>
         mnemonic is "GOTO" or "CALL" or "MOVFF" or "LFSR";
@@ -49,13 +65,13 @@ public static class PIC18BranchRelax
     /// </summary>
     public static void Apply(List<PIC18AsmLine> lines)
     {
-        for (int pass = 0; pass < 16; pass++)
+        for (int pass = 0; pass < 64; pass++)
             if (!Relax(lines))
                 return;
 
         throw new InvalidOperationException(
-            "PIC18 branch relaxation did not settle in 16 passes. Each pass only ever turns a "
-            + "one-word BRA into a two-word GOTO, so it cannot cycle; reaching this means the "
+            "PIC18 branch relaxation did not settle in 64 passes. Each pass only ever widens a "
+            + "branch, never narrows one, so it cannot cycle; reaching this means the "
             + "word accounting is wrong rather than the program being large.");
     }
 
@@ -127,13 +143,15 @@ public static class PIC18BranchRelax
 
         int previousInstruction = -1;
         bool changed = false;
+        var pending = new List<(int At, string Target, string InverseMnemonic, string Hop)>();
 
         for (int i = 0; i < lines.Count; i++)
         {
             var line = lines[i];
             if (line.Type != PIC18AsmLine.LineType.Instruction) continue;
 
-            if (line.Mnemonic != "BRA" || !labelAt.TryGetValue(line.Op1, out int target))
+            bool conditional = Inverse.ContainsKey(line.Mnemonic);
+            if ((line.Mnemonic != "BRA" && !conditional) || !labelAt.TryGetValue(line.Op1, out int target))
             {
                 previousInstruction = i;
                 continue;
@@ -142,7 +160,9 @@ public static class PIC18BranchRelax
             // Offset is relative to the instruction AFTER the branch.
             int delta = target - (offsetOf[i] + 1);
             bool measurable = !SpansOpaque(i, labelLine[line.Op1]);
-            bool outOfRange = delta < BraMin || delta > BraMax;
+            bool outOfRange = conditional
+                ? delta < CondMin || delta > CondMax
+                : delta < BraMin || delta > BraMax;
             bool skipped = previousInstruction >= 0 && IsSkip(lines[previousInstruction].Mnemonic);
 
             if (measurable && outOfRange && skipped)
@@ -163,13 +183,40 @@ public static class PIC18BranchRelax
             // a refusal would break programs that assemble today.
             if (!skipped && (outOfRange || !measurable))
             {
-                line.Mnemonic = "GOTO";
+                if (!conditional)
+                {
+                    line.Mnemonic = "GOTO";
+                }
+                else
+                {
+                    // A conditional branch has no long form on this part, so it becomes the
+                    // opposite test hopping over an unconditional GOTO. Three words instead of
+                    // one, and only where the short one could not reach:
+                    //
+                    //     BZ  far     ->   BNZ  hop
+                    //                      GOTO far
+                    //                 hop:
+                    string hop = $"_relax_hop_{hopCount++}";
+                    pending.Add((i, line.Op1, Inverse[line.Mnemonic], hop));
+                }
                 changed = true;
             }
 
             previousInstruction = i;
         }
 
+        // Applied back to front so an insertion never moves an index still to be rewritten.
+        for (int k = pending.Count - 1; k >= 0; k--)
+        {
+            var (site, target, inverse, hop) = pending[k];
+            lines[site] = PIC18AsmLine.MakeInstruction(inverse, hop);
+            lines.Insert(site + 1, PIC18AsmLine.MakeInstruction("GOTO", target));
+            lines.Insert(site + 2, PIC18AsmLine.MakeLabel(hop));
+        }
+
         return changed;
     }
+
+    // Unique across the whole run, so a second pass cannot reuse a name a first pass emitted.
+    private static int hopCount;
 }
