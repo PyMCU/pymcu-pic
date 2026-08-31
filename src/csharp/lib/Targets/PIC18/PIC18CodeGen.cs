@@ -1675,9 +1675,11 @@ public class PIC18CodeGen : CodeGen
             {
                 if (arg.Src2 is Constant c2m)
                 {
+                    // MULLW multiplies W by a literal, so the operand stays in W. Staging the
+                    // literal in W instead, with MOVLW, would discard the operand, and
+                    // MULWF WREG would then square the literal.
                     LoadIntoW(arg.Src1);
-                    Emit("MOVLW", $"0x{c2m.Value & 0xFF:X2}");
-                    Emit("MULWF", "WREG", "ACCESS");
+                    Emit("MULLW", $"0x{c2m.Value & 0xFF:X2}");
                     Emit("MOVF", "PRODL", "W", "ACCESS");
                     StoreWInto(arg.Dst);
                     return;
