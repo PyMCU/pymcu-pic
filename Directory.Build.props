@@ -16,4 +16,60 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
+
+
+  <!-- A dropped project reference must not be a warning.
+       ====================================================
+       When MSBuild cannot find a referenced project it emits MSB9008 and CARRIES ON. Measured
+       on a case-sensitive volume with a reference spelled at the wrong case:
+
+           MSB9008: the referenced project ../pymcu/lib/Lib.csproj does not exist
+           0 Errors
+
+       The build reports SUCCESS with the dependency silently missing. Whatever uses those
+       types then fails with CS0246, three steps downstream, naming something else. A build
+       that goes green while quietly dropping a reference is worse than one that stops: a
+       case-sensitive CI can pass today on an artifact that is not what it claims to be.
+
+       This promotes that one warning to an error. It adds no detection: MSB9008 is MSBuild's
+       own finding, and it fires only when a reference cannot be resolved, so it cannot
+       trigger in a layout that builds. It covers INTERNAL references too, which the sibling
+       check below deliberately does not.
+  -->
+  <PropertyGroup>
+    <MSBuildWarningsAsErrors>$(MSBuildWarningsAsErrors);MSB9008</MSBuildWarningsAsErrors>
+  </PropertyGroup>
+  <!-- Sibling repositories
+       ====================
+       Some project references in this repository point OUT of it, at a sibling checkout
+       under the same parent directory. They are marked as such where they are declared.
+
+       When a sibling is not there, MSBuild already notices and says so, in a WARNING
+       (MSB9008) that is then buried under a hundred or more compiler errors about
+       namespaces that cannot resolve, because the reference was silently dropped. The cause
+       is on screen and nobody reads it: it scrolled past a hundred errors ago.
+
+       This turns the same detection into a failure that happens FIRST and says what to do.
+       It adds no detection of its own. The condition is Exists() on the same reference
+       MSBuild was already checking, so it cannot fire in a layout that builds, and it is
+       limited to references that leave this repository, so a missing INTERNAL project keeps
+       MSBuild's own message rather than being answered with advice to clone something.
+
+       WHAT IT CANNOT SEE: a sibling supplied as a SYMLINK. Exists() follows the link, so the
+       check passes and the build then fails with CS0234, a namespace that "does not exist",
+       which reads like a broken project reference and is not one. Measured: a real directory
+       builds and a symlink to the same content does not. That is why the message below tells
+       the reader not to reach for one, which is the only place it can be said, because
+       MSBuild cannot test for a link before the reference resolves.
+  -->
+  <Target Name="CheckSiblingRepositories" BeforeTargets="ResolveProjectReferences">
+    <ItemGroup>
+      <_MissingSibling Include="@(ProjectReference)"
+                       Condition="!Exists('%(ProjectReference.FullPath)')
+                                  And !$([System.String]::Copy('%(ProjectReference.FullPath)').StartsWith('$(MSBuildThisFileDirectory)'))" />
+    </ItemGroup>
+    <Error Condition="'@(_MissingSibling)' != ''"
+           Code="PYMCUSIB001"
+           Text="This project references a sibling repository that is not checked out:%0A%0A    @(_MissingSibling->'%(Identity)', '%0A    ')%0A%0AClone it beside this repository, under the same parent directory.%0A%0ADo NOT satisfy it with a symlink. A symlinked sibling passes this check, builds PARTIALLY, and then fails with CS0234 (a namespace that 'does not exist'), which reads like a broken project reference and is not one. A real directory works; a symlink to the same content does not." />
+  </Target>
 </Project>
