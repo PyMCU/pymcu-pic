@@ -823,6 +823,12 @@ public class PIC14CodeGen : CodeGen
                 case Call c when GetValSize(c.Dst) > 1:
                     _needsRetHi = true;
                     break;
+                case Unary u when u.Op == IrUnOp.Not && GetValSize(u.Src) > 1:
+                    // The multi-byte OR-fold in CompileVariant(Unary) below needs
+                    // ScratchCmp as its accumulator -- reusing the signed-compare
+                    // scratch cell, never live at the same time as a `not` result.
+                    _needsSignedCmp = true;
+                    break;
             }
         }
     }
@@ -1693,9 +1699,42 @@ public class PIC14CodeGen : CodeGen
                 Emit("XORLW", "0xFF");
                 break;
             case IrUnOp.Not:
-                Emit("XORLW", "1");
-                Emit("ANDLW", "1");
+            {
+                // `not` tests the TRUTHINESS of the whole operand (which may be wider
+                // than the 1-byte boolean result), not just its low bit -- `XORLW 1;
+                // ANDLW 1` only flips and masks the LOW BIT, which answers the right
+                // question only when the operand is ALREADY strictly 0 or 1. popcount()
+                // returns an arbitrary uint8 (2, say): (2 XOR 1) AND 1 = 1, so
+                // `not popcount(v)` printed True where CPython's `not 2` is False
+                // (probe 296). OR every byte together (W already holds byte 0 from
+                // LoadIntoW above) so a value with a zero low byte but a nonzero high
+                // byte still reads truthy, then answer 1 if the WHOLE operand was
+                // zero, 0 otherwise.
+                int width = GetValSize(arg.Src);
+                if (width > 1)
+                {
+                    Emit("MOVWF", ScratchCmp);
+                    string srcAddr = ResolveAddress(arg.Src);
+                    for (int i = 1; i < width; ++i)
+                    {
+                        string hi = OffsetOperand(srcAddr, i);
+                        SelectBank(hi);
+                        Emit("MOVF", hi, "W");
+                        Emit("IORWF", ScratchCmp, "F");
+                    }
+
+                    Emit("MOVF", ScratchCmp, "F"); // Z = (whole operand == 0)
+                }
+                else
+                {
+                    Emit("ANDLW", "0xFF"); // Z = (W == 0), value unchanged
+                }
+
+                Emit("MOVLW", "0x00");
+                Emit("BTFSC", "STATUS", "2");
+                Emit("MOVLW", "0x01");
                 break;
+            }
             case IrUnOp.Neg:
                 Emit("SUBLW", "0");
                 break;

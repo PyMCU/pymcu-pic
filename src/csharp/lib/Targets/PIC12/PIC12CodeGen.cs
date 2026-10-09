@@ -416,8 +416,20 @@ public class PIC12CodeGen(DeviceConfig cfg) : CodeGen
                 Emit("XORLW", "0xFF");
                 break;
             case PyMCU.IR.UnaryOp.Not:
-                Emit("XORLW", "1");
-                Emit("ANDLW", "1");
+                // `not` tests the TRUTHINESS of the operand, not its low bit --
+                // `XORLW 1; ANDLW 1` answers the right question only when the operand
+                // is ALREADY strictly 0 or 1. popcount() returns an arbitrary uint8
+                // (2, say): (2 XOR 1) AND 1 = 1, so `not popcount(v)` printed True
+                // where CPython's `not 2` is False (probe 296, the same bug fixed in
+                // PIC14/PIC18). This target has no multi-byte values yet, so testing
+                // W (already loaded with the operand above) for zero is the whole
+                // answer: ANDLW 0xFF sets Z from W without changing it, then MOVLW 0
+                // defaults to False and the Z-gated MOVLW 1 answers True only when
+                // the operand was zero.
+                Emit("ANDLW", "0xFF");
+                Emit("MOVLW", "0x00");
+                Emit("BTFSC", "STATUS", "2");
+                Emit("MOVLW", "0x01");
                 break;
             case PyMCU.IR.UnaryOp.Neg:
                 Emit("XORLW", "0xFF");

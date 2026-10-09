@@ -1089,8 +1089,40 @@ public class PIC18CodeGen : CodeGen
             switch (arg.Op)
             {
                 case PyMCU.IR.UnaryOp.Neg: Emit("NEGF", "WREG", "ACCESS"); break;
-                case PyMCU.IR.UnaryOp.Not: Emit("COMF", "WREG", "W", "ACCESS"); break;
                 case PyMCU.IR.UnaryOp.BitNot: Emit("COMF", "WREG", "W", "ACCESS"); break;
+                case PyMCU.IR.UnaryOp.Not:
+                {
+                    // `not` tests the TRUTHINESS of the operand (which may be wider than
+                    // the 1-byte boolean result), not its bit pattern -- COMF (bitwise
+                    // complement, the right answer for BitNot just above) answered a
+                    // different question and inverted the sense of any non-boolean
+                    // operand: popcount() returning 2 complemented to 253 (still
+                    // truthy), so `not popcount(v)` printed True where CPython's `not 2`
+                    // is False (probe 296). Fold every byte together with OR so a value
+                    // with a zero low byte but a non-zero high byte still reads truthy
+                    // (WREG already holds byte 0 from LoadIntoW above), then answer 1 if
+                    // the WHOLE operand was zero, 0 otherwise.
+                    int width = WidthOf(arg.Src);
+                    if (width > 1)
+                    {
+                        string acc = AllocAccessScratch(MultiByteAcc);
+                        Emit("MOVWF", acc, GetAccessMode(acc));
+                        for (int i = 1; i < width; ++i)
+                        {
+                            LoadExtendedByteIntoW(arg.Src, i);
+                            Emit("IORWF", acc, "F", GetAccessMode(acc));
+                        }
+                        Emit("MOVF", acc, "F", GetAccessMode(acc));
+                    }
+                    else
+                    {
+                        Emit("ANDLW", "0xFF");
+                    }
+                    Emit("MOVLW", "0x00");
+                    Emit("BTFSC", "STATUS", "Z", "ACCESS");
+                    Emit("MOVLW", "0x01");
+                    break;
+                }
             }
 
             StoreWInto(arg.Dst);
