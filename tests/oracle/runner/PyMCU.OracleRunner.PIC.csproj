@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>PyMCU.OracleRunner.PIC</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- PicSharp emulator TestKit: sibling repo checkout (../PicSharp next to ../pymcu-pic),
+         same convention tests/integration/PyMCU.IntegrationTests.csproj already uses. -->
+    <ProjectReference Include="..\..\..\..\PicSharp\src\PicSharp.TestKit\PicSharp.TestKit.csproj" />
+  </ItemGroup>
+
+</Project>
