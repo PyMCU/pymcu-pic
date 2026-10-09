@@ -23,6 +23,7 @@ TestResults/
 
 # dotnet publish output
 build/bin/
+build/oracle/
 
 # venv symlink (points at the monorepo venv) and the locally deployed backend binary
 .venv
