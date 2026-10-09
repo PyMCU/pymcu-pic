@@ -450,6 +450,32 @@ public static class PIC14Peephole
     private static bool Bypassed =>
         Environment.GetEnvironmentVariable("PYMCU_NO_PEEPHOLE") == "1";
 
+    /// <summary>
+    /// True when the instruction immediately preceding <paramref name="emittedSoFar"/>'s
+    /// current position (its last entry; a label ends the search) already set W's flags
+    /// from W's CURRENT value -- the same question a flag-setting VALUE no-op (IORLW 0,
+    /// ADDLW 0, XORLW 0, ANDLW 0xFF) answers again, redundantly, when kept. A MOVWF, a
+    /// MOVLW, a bank-select BSF/BCF, or a CALL return does NOT set flags, so the no-op
+    /// is the only thing that does -- dropping it then leaves a later BTFSC/BTFSS reading
+    /// whichever flag some earlier, unrelated instruction last left.
+    /// </summary>
+    private static bool PrecedingInstructionAlreadySetTheseFlags(List<PIC14AsmLine> emittedSoFar)
+    {
+        for (int j = emittedSoFar.Count - 1; j >= 0; j--)
+        {
+            if (emittedSoFar[j].Type == PIC14AsmLine.LineType.Label) return false;
+            if (emittedSoFar[j].Type == PIC14AsmLine.LineType.Instruction)
+            {
+                string m = emittedSoFar[j].Mnemonic;
+                return m is "MOVF" or "ADDWF" or "SUBWF" or "ANDWF" or "IORWF" or "XORWF"
+                    or "INCF" or "DECF" or "ADDLW" or "SUBLW" or "ANDLW" or "XORLW"
+                    or "CLRF" or "CLRW";
+            }
+        }
+
+        return false;
+    }
+
     public static List<PIC14AsmLine> Optimize(List<PIC14AsmLine> lines)
     {
         if (Bypassed) return new List<PIC14AsmLine>(lines);
@@ -728,21 +754,7 @@ public static class PIC14Peephole
                 }
                 else if (current.Mnemonic == "IORLW" && current.Op1 == "0")
                 {
-                    bool redundant = false;
-                    for (int j = next.Count - 1; j >= 0; j--)
-                    {
-                        if (next[j].Type == PIC14AsmLine.LineType.Label) break;
-                        if (next[j].Type == PIC14AsmLine.LineType.Instruction)
-                        {
-                            string m = next[j].Mnemonic;
-                            if (m == "MOVF" || m == "ADDWF" || m == "SUBWF" || m == "ANDWF" ||
-                                m == "IORWF" || m == "XORWF" || m == "INCF" || m == "DECF" ||
-                                m == "ADDLW" || m == "SUBLW" || m == "ANDLW" || m == "XORLW" ||
-                                m == "CLRF" || m == "CLRW")
-                                redundant = true;
-                            break;
-                        }
-                    }
+                    bool redundant = PrecedingInstructionAlreadySetTheseFlags(next);
 
                     if (redundant || (wLit != null && (wLit == "0" || wLit == "0x00")))
                     {
@@ -750,20 +762,42 @@ public static class PIC14Peephole
                         continue;
                     }
                 }
+                // ADDLW 0 / XORLW 0 / ANDLW 0xFF are VALUE no-ops (W is unchanged), but
+                // each is also a flag-setting instruction: its Z (and, for ADDLW, C) flag
+                // reflects W's CURRENT value, which may be exactly what a BTFSC/BTFSS right
+                // after it is there to read. Removing it unconditionally is only safe when
+                // the immediately preceding instruction ALREADY set the identical flags from
+                // the identical value -- the same redundancy test IORLW 0 just above already
+                // makes. Without it, `not`'s materialization (ANDLW 0xFF; MOVLW 0; BTFSC
+                // STATUS,2; MOVLW 1) lost its flag-setting ANDLW whenever nothing before it
+                // happened to set Z the same way (a MOVWF, say, which does not touch
+                // STATUS), and the branch read whatever Z some earlier, unrelated
+                // instruction had left -- probe 296's `not popcount(v)` printed the inverse
+                // of CPython's answer, and not because of chance: every call result reaches
+                // its first use through a MOVWF, never a flag-setting op.
                 else if (current.Mnemonic == "ADDLW" && (current.Op1 == "0" || current.Op1 == "0x00"))
                 {
-                    changed = true;
-                    continue;
+                    if (PrecedingInstructionAlreadySetTheseFlags(next))
+                    {
+                        changed = true;
+                        continue;
+                    }
                 }
                 else if (current.Mnemonic == "XORLW" && (current.Op1 == "0" || current.Op1 == "0x00"))
                 {
-                    changed = true;
-                    continue;
+                    if (PrecedingInstructionAlreadySetTheseFlags(next))
+                    {
+                        changed = true;
+                        continue;
+                    }
                 }
                 else if (current.Mnemonic == "ANDLW" && (current.Op1 == "255" || current.Op1 == "0xFF"))
                 {
-                    changed = true;
-                    continue;
+                    if (PrecedingInstructionAlreadySetTheseFlags(next))
+                    {
+                        changed = true;
+                        continue;
+                    }
                 }
                 else if (current.Mnemonic == "BSF" || current.Mnemonic == "BCF")
                 {
