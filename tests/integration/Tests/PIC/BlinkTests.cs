@@ -1,3 +1,4 @@
+using PicSharp.TestKit.Boards;
 using FluentAssertions;
 using NUnit.Framework;
 using PicSharp.TestKit.Extensions;
@@ -19,10 +20,10 @@ namespace PyMCU.IntegrationTests.Tests.PIC;
 [TestFixture]
 public class BlinkTests
 {
-    private SimSession _session = null!;
+    private SimSession<Pic16F877ASimulation> _session = null!;
 
     [OneTimeSetUp]
-    public void BuildFirmware() => _session = new SimSession(PymcuCompiler.Build("blink"));
+    public void BuildFirmware() => _session = new SimSession<Pic16F877ASimulation>(PymcuCompiler.Build("blink"));
 
     [Test]
     public void Led_StartsHighAfterBoot()
@@ -52,7 +53,7 @@ public class BlinkTests
         pic.RunUntil(_ => !pic.PortBProbe.Pin(0), maxSteps: 4_000_000);  // after delay_ms(100)
 
         // delay_ms(100) at 20 MHz = ~500_000 instruction cycles. Accept 60-140 ms.
-        double ms = (pic.Cycles - start) * 4_000.0 / SimSession.ClockHz;
+        double ms = (pic.Cycles - start) * 4_000.0 / SimSession<Pic16F877ASimulation>.ClockHz;
         ms.Should().BeInRange(60, 140, "delay_ms(100) must be calibrated for __FREQ__ = 20 MHz");
     }
 

@@ -1,3 +1,4 @@
+using PicSharp.TestKit.Boards;
 using FluentAssertions;
 using NUnit.Framework;
 
@@ -28,10 +29,10 @@ public class UartTests
                 uart.write(b + 1)
         """;
 
-    private SimSession _session = null!;
+    private SimSession<Pic16F877ASimulation> _session = null!;
 
     [OneTimeSetUp]
-    public void BuildFirmware() => _session = new SimSession(PymcuCompiler.BuildSource(Source));
+    public void BuildFirmware() => _session = new SimSession<Pic16F877ASimulation>(PymcuCompiler.BuildSource(Source));
 
     [Test]
     public void Banner_ArrivesOnSerial()

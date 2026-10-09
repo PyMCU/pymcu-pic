@@ -1,3 +1,4 @@
+using PicSharp.TestKit.Boards;
 using FluentAssertions;
 using NUnit.Framework;
 using PicSharp.Peripherals;
@@ -47,10 +48,10 @@ public class VarShiftCountTests
                 pass
         """;
 
-    private SimSession _session = null!;
+    private SimSession<Pic16F877ASimulation> _session = null!;
 
     [OneTimeSetUp]
-    public void BuildFirmware() => _session = new SimSession(PymcuCompiler.BuildSource(Source));
+    public void BuildFirmware() => _session = new SimSession<Pic16F877ASimulation>(PymcuCompiler.BuildSource(Source));
 
     private static void Drive(Gpio port, byte value)
     {
