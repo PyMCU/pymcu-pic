@@ -1,6 +1,7 @@
 using System.Text.RegularExpressions;
 using FluentAssertions;
 using NUnit.Framework;
+using PicSharp.TestKit.Boards;
 
 namespace PyMCU.IntegrationTests.Tests.PIC;
 
@@ -55,7 +56,7 @@ public class NotOperatorTests
     [Test]
     public void NotOfANonBooleanValue_MatchesCPython_OnPic16F877A()
     {
-        var pic = new SimSession(PymcuCompiler.BuildSource(Source)).Reset();
+        var pic = new SimSession<Pic16F877ASimulation>(PymcuCompiler.BuildSource(Source)).Reset();
         pic.RunUntilSerial(pic.Serial, Expected);
         pic.Serial.Text.Should().Be(Expected,
             "`not popcount(v)` tests the WHOLE operand for zero, not its low bit");
@@ -70,7 +71,7 @@ public class NotOperatorTests
         // (ANDLW 0xFF/ADDLW 0/XORLW 0 dropped unconditionally, even when nothing
         // before them re-set the same flags) only ever hid a codegen bug that
         // would otherwise still be there.
-        var pic = new SimSession(PymcuCompiler.BuildSource(Source, noPeephole: true)).Reset();
+        var pic = new SimSession<Pic16F877ASimulation>(PymcuCompiler.BuildSource(Source, noPeephole: true)).Reset();
         pic.RunUntilSerial(pic.Serial, Expected);
         pic.Serial.Text.Should().Be(Expected);
     }
@@ -112,5 +113,44 @@ public class NotOperatorTests
         // whole operand was zero.
         asm.Should().MatchRegex(@"ANDLW\s+0xFF\s*\n\s*MOVLW\s+0x00\s*\n\s*BTFSC\s+STATUS,\s*Z,\s*ACCESS\s*\n\s*MOVLW\s+0x01",
             "`not` must test the operand against zero, not flip its low bit or complement its bits");
+    }
+
+    // fix/pic-simsession closed the gap this skipped: SimSession is now generic
+    // (SimSession<TSim>), so a pic18f45k50 build can run on the board that
+    // actually understands its machine code instead of silently falling
+    // through Pic16F877ASimulation's mid-range decoder. Re-measured end to
+    // end with that fix in place: this DOES now produce real serial output.
+    [Test]
+    public void NotOfANonBooleanValue_MatchesCPython_OnPic18F45K50_EndToEnd()
+    {
+        var pic = new SimSession<Pic18F45K50Simulation>(PymcuCompiler.BuildSource("""
+            from pymcu.hal.pic18.uart import UART
+            from pymcu.types import uint8
+
+
+            def popcount(n: uint8) -> uint8:
+                c: uint8 = 0
+                while n != 0:
+                    c = c + (n & 1)
+                    n = n >> 1
+                return c
+
+
+            def main():
+                u = UART(9600)
+                v: uint8 = 6
+                r1: uint8 = not popcount(v)
+                r2: uint8 = not (v - 6)
+                r3: uint8 = not (v & 1)
+                u.write(r1)
+                u.write(r2)
+                u.write(r3)
+                while True:
+                    pass
+            """, target: "pic18f45k50", frequencyHz: 16_000_000), clockHz: 16_000_000).Reset();
+        pic.RunUntilSerial(pic.Serial, "\u0000\u0001\u0001");
+        pic.Serial.Bytes.Should().Equal([0, 1, 1],
+            "`not popcount(v)` tests the WHOLE operand for zero, not its bit pattern -- now measured " +
+            "on the real pic18f45k50 board (SimSession<Pic18F45K50Simulation>), not just its assembly");
     }
 }
