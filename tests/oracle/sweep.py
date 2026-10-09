@@ -138,10 +138,25 @@ TARGET_FREQUENCY = {
     "pic18f45k50": 16_000_000,
 }
 
+# A `# expect: refuse <text>` header is worded for AVR's toolchain (binutils' ld), which
+# this sweep's own refusal may say correctly but differently -- confirmed by compiling
+# probe 081 (@extern on an undefined symbol) directly on both chips: gpasm fails at the
+# ASSEMBLER stage, not the linker, with "Error[113]   Symbol not previously defined:
+# "<name>"" (wrapped by a generic "Error[181]   Error generating hex file."), never the
+# text "undefined reference" at all. Same mechanism ARM's sweep documents for its own
+# linker (opt's "use of undefined value" vs AVR ld's "undefined reference") -- a legitimate
+# diagnostic, just a different toolchain's wording for the same refusal, not a bug.
+LINKER_DIAGNOSTIC_EQUIVALENTS = {
+    "undefined reference": "Symbol not previously defined",
+}
+
 
 def _diagnostic_matches(expected: str, log: str) -> bool:
     normalized_log = " ".join(log.split())
-    return " ".join(expected.split()) in normalized_log
+    if " ".join(expected.split()) in normalized_log:
+        return True
+    equivalent = LINKER_DIAGNOSTIC_EQUIVALENTS.get(expected)
+    return equivalent is not None and " ".join(equivalent.split()) in normalized_log
 
 
 def _load_avr_oracle_module():
